@@ -70,7 +70,11 @@ class NixlBackendSelection:
                     return False
                 agent.create_backend(self.backend_name, {"bucket": bucket})
             else:
-                agent.create_backend(self.backend_name)
+                init: dict[str, str] = {}
+                if (self.backend_name=="POSIX"):
+                    init["use_uring"]="true"
+                    init["use_aio"]="false"
+                agent.create_backend(self.backend_name, init)
 
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
             logger.debug(

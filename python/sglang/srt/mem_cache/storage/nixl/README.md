@@ -36,6 +36,21 @@ Consolidated utility classes:
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
+## Using NIXL for HiCache backend
+When running the SGLang server, indicate `nixl` for `hicache-storage-backend` parameter, for instance:
+
+```bash
+python3 -m sglang.launch_server --model-path <model> --host <ip> --port <port> --page-size 64 --enable-hierarchical-cache --hicache-ratio 2 --hicache-size 64 --hicache-write-policy write_through --hicache-storage-backend nixl
+```
+
+To customize the base directory for files, you can set the following environment variable:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/desired/dir
+```
+
+Selection of any storage backend like 3FS requires availability of that library on the system, and the bakcend is selected based on the priority mentioned above.
+
 ## Running Unit Tests
 
 ### Prerequisites
@@ -154,4 +169,6 @@ The system automatically selects the best available backend, with POSIX as the d
 
 ## Note
 
-This is v0 of the NIXL connector. Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput). These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.
+This connector support pre-registration of files and objects as well, to reduce the registration overheads during run-time.
+This feature is not used currently as there is a separate file/object per key and will be useful when block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput) is supported.
+Currently HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.

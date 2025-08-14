@@ -103,11 +103,14 @@ class HiCacheNixl(HiCacheStorage):
         # Initialize transfer, default assumption that tensor was registered
         try:
             xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)
+            logger.debug(f"Tensor was pre-registered")
         except:
             # Check if it was due to missing pre-registration
             if not self.register_buffers(tensors):
                 logger.error("Failed to register tensors")
                 return False
+
+            logger.debug(f"Tensor was not pre-registered")
 
             try:
                 xfer_req = self.agent.initialize_xfer(direction, tensor_descs, storage_descs, self.agent_name)

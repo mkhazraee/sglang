@@ -85,6 +85,7 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     dst_kv_item_len: int
     dst_num_slots: Optional[int] = None
+    dst_num_slots_state: Optional[int] = None
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
 
@@ -119,6 +120,7 @@ class KVArgsRegisterInfo:
             decode_tp_rank=int(msg[10].decode("ascii")),
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_num_slots=int(msg[14].decode("ascii")) if len(msg) > 14 else None,
+            dst_num_slots_state=int(msg[15].decode("ascii")) if len(msg) > 15 else None,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
@@ -256,12 +258,24 @@ class NixlKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.use_prepped_transfer = True  # Set to False to fall back to non-prepped path (for debugging).
             if self.use_prepped_transfer:
-                self.prep_handles = {}
+                self.prep_handles = {}  # peer_name -> combined KV+state dlist handle
                 self.prep_handle_slice_src: Optional[tuple] = None  # (handle, num_groups, num_ptr_pairs, num_slots)
                 self.prep_handles_slice_dst: Dict[str, tuple] = {}  # peer_name -> (handle, num_slots)
                 self.peer_head_group: Dict[str, int] = {}  # peer_name -> head_group_idx
                 self._num_slots_src: int = self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
-                self._init_prep_handle("", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id)
+                self._num_slots_src_state: Optional[int] = None
+                # Offset of state entries in the combined dlist (= num_kv_layers * num_slots_src).
+                self._kv_dlist_src_size: int = len(self.kv_args.kv_item_lens) * self._num_slots_src
+                self._kv_dlist_dst_size: Dict[str, int] = {}  # peer_name -> KV entry count in dst dlist
+                state_type = getattr(self.kv_args, "state_type", "none")
+                if state_type in ("nsa", "swa") and self.kv_args.state_data_ptrs:
+                    self._num_slots_src_state = (
+                        self.kv_args.state_data_lens[0] // self.kv_args.state_item_lens[0]
+                    )
+                self._init_prep_handle(
+                    "", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id,
+                    state_ptrs=self.kv_args.state_data_ptrs if self._num_slots_src_state is not None else None,
+                )
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
@@ -400,26 +414,28 @@ class NixlKVManager(CommonKVManager):
                 # Safe to use prefill's kv_item_lens for the dst dlist stride:
                 # equal_tp guarantees identical heads-per-rank (same item_len);
                 # MLA latent shape is TP-invariant.
+                dst_num_slots = decode_kv_args.dst_num_slots if decode_kv_args.dst_num_slots is not None else self._num_slots_src
+                self._kv_dlist_dst_size[agent_name] = len(self.kv_args.kv_item_lens) * dst_num_slots
                 self._init_prep_handle(
                     agent_name, decode_kv_args.dst_kv_ptrs, decode_kv_args.gpu_id,
                     num_slots=decode_kv_args.dst_num_slots,
+                    state_ptrs=decode_kv_args.dst_state_data_ptrs if self._num_slots_src_state is not None else None,
+                    num_slots_state=decode_kv_args.dst_num_slots_state,
                 )
             else:
                 self._init_prep_handle_slice(agent_name, decode_kv_args)
 
-    def _init_prep_handle(
-        self, peer_name: str, kv_ptrs: list[int], gpu_id: int, num_slots: Optional[int] = None
-    ):
-        """Pre-build NIXL dlist: all KV slots × all layers.
-
-        peer_name="" = src side; agent name = dst side. num_slots overrides the local
-        slot count — pass decode's count for the dst dlist (may differ from prefill).
-        Uses prefill's kv_item_lens as stride; requires equal per-slot byte size (equal-TP or MLA).
-        """
+    def _build_prep_entries(
+        self,
+        ptrs: list[int],
+        item_lens: list[int],
+        data_lens: list[int],
+        gpu_id: int,
+        num_slots: Optional[int] = None,
+    ) -> list:
+        """Build descriptor arrays for a set of buffers (one array per layer/ptr)."""
         arrays = []
-        for base_ptr, item_len, data_len in zip(
-            kv_ptrs, self.kv_args.kv_item_lens, self.kv_args.kv_data_lens
-        ):
+        for base_ptr, item_len, data_len in zip(ptrs, item_lens, data_lens):
             n = num_slots if num_slots is not None else (data_len // item_len)
             addrs = np.arange(n, dtype=np.int64) * item_len + base_ptr
             arrays.append(np.column_stack([
@@ -427,12 +443,35 @@ class NixlKVManager(CommonKVManager):
                 np.full(n, item_len, dtype=np.int64),
                 np.full(n, gpu_id, dtype=np.int64),
             ]))
-        self.prep_handles[peer_name] = self.agent.prep_xfer_dlist(
-            peer_name, np.vstack(arrays), "VRAM"
+        return arrays
+
+    def _init_prep_handle(
+        self,
+        peer_name: str,
+        kv_ptrs: list[int],
+        gpu_id: int,
+        num_slots: Optional[int] = None,
+        state_ptrs: Optional[list[int]] = None,
+        num_slots_state: Optional[int] = None,
+    ):
+        """Pre-build a combined NIXL dlist: KV layers followed by state layers (if any).
+
+        peer_name="" = src side; agent name = dst side. num_slots overrides the local
+        KV slot count; num_slots_state overrides the state pool slot count.
+        State entries are appended after all KV entries — the offset is _kv_dlist_src_size
+        (src) or _kv_dlist_dst_size[peer_name] (dst), used during index computation.
+        """
+        arrays = self._build_prep_entries(
+            kv_ptrs, self.kv_args.kv_item_lens, self.kv_args.kv_data_lens, gpu_id, num_slots,
         )
-        assert self.prep_handles[peer_name] is not None, (
-            f"prep_xfer_dlist returned None for peer '{peer_name}'"
-        )
+        if state_ptrs:
+            arrays += self._build_prep_entries(
+                state_ptrs, self.kv_args.state_item_lens, self.kv_args.state_data_lens,
+                gpu_id, num_slots_state,
+            )
+        handle = self.agent.prep_xfer_dlist(peer_name, np.vstack(arrays), "VRAM")
+        assert handle is not None, f"prep_xfer_dlist returned None for peer '{peer_name}'"
+        self.prep_handles[peer_name] = handle
 
     def _init_prep_handle_slice(
         self, peer_name: str, decode_kv_args: KVArgsRegisterInfo
@@ -553,10 +592,16 @@ class NixlKVManager(CommonKVManager):
         dst_data_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        prefill_state_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_state_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
-        Used by both send_kvcache and maybe_send_extra."""
-        # Prepped path (KV only; state transfers use the non-prepped path below).
+        Used by both send_kvcache and maybe_send_extra.
+
+        When prefill_state_indices/dst_state_indices are provided, state is bundled
+        into the same make_prepped_xfer call using the combined KV+state dlist handle.
+        """
+        # Prepped path: use the combined KV+state dlist handle when available.
         if (
             self.use_prepped_transfer
             and src_data_ptrs is self.kv_args.kv_data_ptrs
@@ -564,19 +609,44 @@ class NixlKVManager(CommonKVManager):
         ):
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
+            num_kv_layers = len(item_lens)
             info = self.decode_kv_args_table[peer_name]
-            num_slots_dst = info.dst_num_slots if info.dst_num_slots is not None else self._num_slots_src
-            src_layer_lengths = [self._num_slots_src] * len(item_lens)
-            dst_layer_lengths = [num_slots_dst] * len(item_lens)
-            src_indices = repeat_indices_over_layers(prefill_data_indices, src_layer_lengths)
-            dst_indices = repeat_indices_over_layers(dst_data_indices, dst_layer_lengths)
+            num_slots_src = self._num_slots_src
+            num_slots_dst = info.dst_num_slots if info.dst_num_slots is not None else num_slots_src
+
+            src_kv_flat = repeat_indices_over_layers(prefill_data_indices, [num_slots_src] * num_kv_layers)
+            dst_kv_flat = repeat_indices_over_layers(dst_data_indices, [num_slots_dst] * num_kv_layers)
+
+            if (
+                prefill_state_indices is not None
+                and dst_state_indices is not None
+                and self._num_slots_src_state is not None
+            ):
+                # Append state indices, shifted past the KV entries in the combined dlist.
+                num_state_layers = len(self.kv_args.state_item_lens)
+                num_slots_dst_state = (
+                    info.dst_num_slots_state
+                    if info.dst_num_slots_state is not None
+                    else self._num_slots_src_state
+                )
+                src_state_flat = repeat_indices_over_layers(
+                    prefill_state_indices, [self._num_slots_src_state] * num_state_layers
+                )
+                dst_state_flat = repeat_indices_over_layers(
+                    dst_state_indices, [num_slots_dst_state] * num_state_layers
+                )
+                src_indices = np.concatenate(
+                    [src_kv_flat, (src_state_flat + self._kv_dlist_src_size).astype(np.int32)]
+                )
+                dst_indices = np.concatenate(
+                    [dst_kv_flat, (dst_state_flat + self._kv_dlist_dst_size[peer_name]).astype(np.int32)]
+                )
+            else:
+                src_indices = src_kv_flat
+                dst_indices = dst_kv_flat
+
             xfer_handle = self.agent.make_prepped_xfer(
-                "WRITE",
-                src_prep,
-                src_indices,
-                dst_prep,
-                dst_indices,
-                notif.encode("ascii"),
+                "WRITE", src_prep, src_indices, dst_prep, dst_indices, notif.encode("ascii"),
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
@@ -585,7 +655,7 @@ class NixlKVManager(CommonKVManager):
                 raise Exception("KVSender failed to post prepped transfer")
             return xfer_handle
 
-        # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
+        # Non-prepped path: fallback for slice transfers.
         # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -654,6 +724,8 @@ class NixlKVManager(CommonKVManager):
         dst_kv_indices: npt.NDArray[np.int32],
         dst_gpu_id: int,
         notif: str,
+        prefill_state_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_state_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         return self._send_kvcache_generic(
             peer_name=peer_name,
@@ -664,6 +736,8 @@ class NixlKVManager(CommonKVManager):
             dst_data_indices=dst_kv_indices,
             dst_gpu_id=dst_gpu_id,
             notif=notif,
+            prefill_state_indices=prefill_state_indices,
+            dst_state_indices=dst_state_indices,
         )
 
     def send_kvcache_slice(
@@ -1080,10 +1154,23 @@ class NixlKVManager(CommonKVManager):
             assert req.agent_name in self.decode_kv_args_table
 
             dst_info = self.decode_kv_args_table[req.agent_name]
-            notif = (
-                f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
-            )
             decode_tp_size = dst_info.decode_tp_size
+            state_type = getattr(self.kv_args, "state_type", "none")
+            # Bundle NSA/SWA state with the last KV chunk when using the prepped path
+            # (non-slice only — slice transfers don't use the combined dlist handle).
+            bundle_state = (
+                is_last
+                and state_indices is not None
+                and state_type in ("nsa", "swa")
+                and self.use_prepped_transfer
+                and self._num_slots_src_state is not None
+                and (self.is_mla_backend or decode_tp_size == self.attn_tp_size)
+            )
+
+            if bundle_state:
+                kv_notif = f"{req.room}_kvstate_{chunk_id}_{self.kv_args.engine_rank}"
+            else:
+                kv_notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
 
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
@@ -1092,7 +1179,9 @@ class NixlKVManager(CommonKVManager):
                     dst_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
                     dst_info.gpu_id,
-                    notif,
+                    kv_notif,
+                    prefill_state_indices=np.array(state_indices, dtype=np.int32) if bundle_state else None,
+                    dst_state_indices=np.array(req.dst_state_indices, dtype=np.int32) if bundle_state else None,
                 )
             else:
                 kv_xfer_handle = self.send_kvcache_slice(
@@ -1101,7 +1190,7 @@ class NixlKVManager(CommonKVManager):
                     dst_info.dst_kv_ptrs,
                     chunked_dst_kv_indice,
                     dst_info.gpu_id,
-                    notif,
+                    kv_notif,
                     prefill_tp_size=self.attn_tp_size,
                     decode_tp_size=decode_tp_size,
                     decode_tp_rank=dst_info.decode_tp_rank,
@@ -1111,7 +1200,7 @@ class NixlKVManager(CommonKVManager):
             handles.append(kv_xfer_handle)
             # Aux/state sent only with the last chunk.
             if is_last:
-                if state_indices is not None:
+                if state_indices is not None and not bundle_state:
                     state_xfer_handle = self.maybe_send_extra(
                         req.agent_name,
                         state_indices,
@@ -1158,6 +1247,17 @@ class NixlKVManager(CommonKVManager):
                             status.num_pp_ranks_expected = (
                                 self.required_prefill_response_num_table.get(room, 1)
                             )
+                elif components[1] == "kvstate":
+                    # Combined KV+state notification (last chunk with bundled NSA/SWA state).
+                    chunk_id = int(components[2])
+                    pp_rank = int(components[3]) if len(components) > 3 else 0
+                    status.received_kvs_per_pp[pp_rank].add(chunk_id)
+                    status.expected_kvs_per_pp[pp_rank] = chunk_id + 1
+                    status.received_state_per_pp.add(pp_rank)
+                    if status.num_pp_ranks_expected is None:
+                        status.num_pp_ranks_expected = (
+                            self.required_prefill_response_num_table.get(room, 1)
+                        )
                 elif components[1] == "aux":
                     status.received_aux = True
                 elif components[1] == "state":
@@ -1407,6 +1507,11 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor,
             str(
                 self.kv_mgr.kv_args.kv_data_lens[0] // self.kv_mgr.kv_args.kv_item_lens[0]
+            ).encode("ascii"),
+            str(
+                self.kv_mgr.kv_args.state_data_lens[0] // self.kv_mgr.kv_args.state_item_lens[0]
+                if self.kv_mgr.kv_args.state_data_lens
+                else 0
             ).encode("ascii"),
         ]
         for bootstrap_info in self.bootstrap_infos:

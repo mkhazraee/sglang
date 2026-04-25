@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -86,6 +86,7 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_num_slots: Optional[int] = None
     dst_num_slots_state: Optional[int] = None
+    dst_num_slots_per_layer: list[int] = dataclasses.field(default_factory=list)
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
 
@@ -99,12 +100,15 @@ class KVArgsRegisterInfo:
 
         dst_state_item_lens = []
         dst_state_dim_per_tensor = []
+        dst_num_slots_per_layer = []
         if len(msg) > 12 and len(msg[12]) > 0:
             dst_state_item_lens = list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
         if len(msg) > 13 and len(msg[13]) > 0:
             dst_state_dim_per_tensor = list(
                 struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
             )
+        if len(msg) > 16 and len(msg[16]) > 0:
+            dst_num_slots_per_layer = list(struct.unpack(f"{len(msg[16]) // 4}I", msg[16]))
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -121,6 +125,7 @@ class KVArgsRegisterInfo:
             dst_kv_item_len=int(msg[11].decode("ascii")),
             dst_num_slots=int(msg[14].decode("ascii")) if len(msg) > 14 else None,
             dst_num_slots_state=int(msg[15].decode("ascii")) if len(msg) > 15 else None,
+            dst_num_slots_per_layer=dst_num_slots_per_layer,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
@@ -261,19 +266,31 @@ class NixlKVManager(CommonKVManager):
                 self.prep_handle_slice_src: Optional[tuple] = None  # (handle, num_groups, num_ptr_pairs, num_slots)
                 self.prep_handles_slice_dst: Dict[str, tuple] = {}  # peer_name -> (handle, num_slots)
                 self.peer_head_group: Dict[str, int] = {}  # peer_name -> head_group_idx
-                self._num_slots_src: int = self.kv_args.kv_data_lens[0] // self.kv_args.kv_item_lens[0]
+                # Per-layer slot counts (V4: non-uniform item_lens across pool groups).
+                # Scalar _num_slots_src kept as alias of [0] for backward compatibility.
+                self._slots_per_kv_layer: list[int] = [
+                    dl // il
+                    for dl, il in zip(self.kv_args.kv_data_lens, self.kv_args.kv_item_lens)
+                ]
+                self._num_slots_src: int = self._slots_per_kv_layer[0]
                 self._num_slots_src_state: Optional[int] = None
-                # Offset of state entries in the combined dlist (= num_kv_layers * num_slots_src).
-                self._kv_dlist_src_size: int = len(self.kv_args.kv_item_lens) * self._num_slots_src
+                self._slots_per_state_layer: list[int] = []
+                # Offset of state entries in the combined dlist (= sum of per-layer KV slot counts).
+                self._kv_dlist_src_size: int = sum(self._slots_per_kv_layer)
                 self._kv_dlist_dst_size: Dict[str, int] = {}  # peer_name -> KV entry count in dst dlist
+                self._dst_slots_per_kv_layer: Dict[str, list[int]] = {}  # peer_name -> per-layer dst slot counts
                 state_type = getattr(self.kv_args, "state_type", "none")
                 if state_type in ("nsa", "swa") and self.kv_args.state_data_ptrs:
-                    self._num_slots_src_state = (
-                        self.kv_args.state_data_lens[0] // self.kv_args.state_item_lens[0]
-                    )
+                    self._slots_per_state_layer = [
+                        dl // il
+                        for dl, il in zip(self.kv_args.state_data_lens, self.kv_args.state_item_lens)
+                    ]
+                    self._num_slots_src_state = self._slots_per_state_layer[0]
                 self._init_prep_handle(
                     "", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id,
+                    num_slots=self._slots_per_kv_layer,
                     state_ptrs=self.kv_args.state_data_ptrs if self._num_slots_src_state is not None else None,
+                    num_slots_state=self._slots_per_state_layer if self._slots_per_state_layer else None,
                 )
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -413,11 +430,23 @@ class NixlKVManager(CommonKVManager):
                 # Safe to use prefill's kv_item_lens for the dst dlist stride:
                 # equal_tp guarantees identical heads-per-rank (same item_len);
                 # MLA latent shape is TP-invariant.
-                dst_num_slots = decode_kv_args.dst_num_slots if decode_kv_args.dst_num_slots is not None else self._num_slots_src
-                self._kv_dlist_dst_size[agent_name] = len(self.kv_args.kv_item_lens) * dst_num_slots
+                #
+                # Per-layer dst slot counts: use wire-provided list if present (V4),
+                # else fall back to scalar broadcast.
+                if decode_kv_args.dst_num_slots_per_layer:
+                    dst_slots_per_kv_layer = decode_kv_args.dst_num_slots_per_layer
+                else:
+                    dst_num_slots = (
+                        decode_kv_args.dst_num_slots
+                        if decode_kv_args.dst_num_slots is not None
+                        else self._num_slots_src
+                    )
+                    dst_slots_per_kv_layer = [dst_num_slots] * len(self.kv_args.kv_item_lens)
+                self._dst_slots_per_kv_layer[agent_name] = dst_slots_per_kv_layer
+                self._kv_dlist_dst_size[agent_name] = sum(dst_slots_per_kv_layer)
                 self._init_prep_handle(
                     agent_name, decode_kv_args.dst_kv_ptrs, decode_kv_args.gpu_id,
-                    num_slots=decode_kv_args.dst_num_slots,
+                    num_slots=dst_slots_per_kv_layer,
                     state_ptrs=decode_kv_args.dst_state_data_ptrs if self._num_slots_src_state is not None else None,
                     num_slots_state=decode_kv_args.dst_num_slots_state,
                 )
@@ -430,12 +459,21 @@ class NixlKVManager(CommonKVManager):
         item_lens: list[int],
         data_lens: list[int],
         gpu_id: int,
-        num_slots: Optional[int] = None,
+        num_slots: Optional[Union[int, list[int]]] = None,
     ) -> list:
-        """Build descriptor arrays for a set of buffers (one array per layer/ptr)."""
+        """Build descriptor arrays for a set of buffers (one array per layer/ptr).
+
+        num_slots can be a scalar (uniform), a per-layer list (V4 multi-pool),
+        or None (inferred from data_len // item_len).
+        """
         arrays = []
-        for base_ptr, item_len, data_len in zip(ptrs, item_lens, data_lens):
-            n = num_slots if num_slots is not None else (data_len // item_len)
+        for i, (base_ptr, item_len, data_len) in enumerate(zip(ptrs, item_lens, data_lens)):
+            if num_slots is None:
+                n = data_len // item_len
+            elif isinstance(num_slots, list):
+                n = num_slots[i]
+            else:
+                n = num_slots
             addrs = np.arange(n, dtype=np.int64) * item_len + base_ptr
             arrays.append(np.column_stack([
                 addrs,
@@ -449,9 +487,9 @@ class NixlKVManager(CommonKVManager):
         peer_name: str,
         kv_ptrs: list[int],
         gpu_id: int,
-        num_slots: Optional[int] = None,
+        num_slots: Optional[Union[int, list[int]]] = None,
         state_ptrs: Optional[list[int]] = None,
-        num_slots_state: Optional[int] = None,
+        num_slots_state: Optional[Union[int, list[int]]] = None,
     ):
         """Pre-build a combined NIXL dlist: KV layers followed by state layers (if any).
 
@@ -608,13 +646,12 @@ class NixlKVManager(CommonKVManager):
         ):
             src_prep = self.prep_handles[""]
             dst_prep = self.prep_handles[peer_name]
-            num_kv_layers = len(item_lens)
             info = self.decode_kv_args_table[peer_name]
-            num_slots_src = self._num_slots_src
-            num_slots_dst = info.dst_num_slots if info.dst_num_slots is not None else num_slots_src
+            slots_per_kv_layer_src = self._slots_per_kv_layer
+            slots_per_kv_layer_dst = self._dst_slots_per_kv_layer[peer_name]
 
-            src_kv_flat = repeat_indices_over_layers(prefill_data_indices, [num_slots_src] * num_kv_layers)
-            dst_kv_flat = repeat_indices_over_layers(dst_data_indices, [num_slots_dst] * num_kv_layers)
+            src_kv_flat = repeat_indices_over_layers(prefill_data_indices, slots_per_kv_layer_src)
+            dst_kv_flat = repeat_indices_over_layers(dst_data_indices, slots_per_kv_layer_dst)
 
             if (
                 prefill_state_indices is not None
@@ -622,17 +659,16 @@ class NixlKVManager(CommonKVManager):
                 and self._num_slots_src_state is not None
             ):
                 # Append state indices, shifted past the KV entries in the combined dlist.
-                num_state_layers = len(self.kv_args.state_item_lens)
                 num_slots_dst_state = (
                     info.dst_num_slots_state
                     if info.dst_num_slots_state is not None
                     else self._num_slots_src_state
                 )
                 src_state_flat = repeat_indices_over_layers(
-                    prefill_state_indices, [self._num_slots_src_state] * num_state_layers
+                    prefill_state_indices, self._slots_per_state_layer
                 )
                 dst_state_flat = repeat_indices_over_layers(
-                    dst_state_indices, [num_slots_dst_state] * num_state_layers
+                    dst_state_indices, [num_slots_dst_state] * len(self.kv_args.state_item_lens)
                 )
                 src_indices = np.concatenate(
                     [src_kv_flat, (src_state_flat + self._kv_dlist_src_size).astype(np.int32)]
@@ -1486,6 +1522,20 @@ class NixlKVReceiver(CommonKVReceiver):
         packed_state_item_lens = struct.pack(f"{len(state_item_lens)}I", *state_item_lens) if state_item_lens else b""
         packed_state_dim_per_tensor = struct.pack(f"{len(state_dim_per_tensor)}I", *state_dim_per_tensor) if state_dim_per_tensor else b""
 
+        # Per-layer slot counts for V4 multi-pool support (msg[16]).
+        # Empty when all layers have the same slot count (uniform models).
+        kv_slots_per_layer = [
+            dl // il
+            for dl, il in zip(
+                self.kv_mgr.kv_args.kv_data_lens, self.kv_mgr.kv_args.kv_item_lens
+            )
+        ]
+        if len(set(kv_slots_per_layer)) == 1:
+            # Uniform: omit the field so older receivers see an empty msg[16].
+            packed_kv_slots_per_layer = b""
+        else:
+            packed_kv_slots_per_layer = struct.pack(f"{len(kv_slots_per_layer)}I", *kv_slots_per_layer)
+
         # Build the message template once; only agent metadata varies per bootstrap peer.
         msg = [
             GUARD,
@@ -1511,6 +1561,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 if self.kv_mgr.kv_args.state_data_lens
                 else 0
             ).encode("ascii"),
+            packed_kv_slots_per_layer,  # msg[16]: per-layer slot counts (empty = uniform)
         ]
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)

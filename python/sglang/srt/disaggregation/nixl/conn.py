@@ -32,6 +32,54 @@ logger = logging.getLogger(__name__)
 GUARD = b"NixlMsgGuard"
 
 
+def _compute_pool_group_boundaries(kv_item_lens: List[int]) -> List[tuple]:
+    """Group consecutive layers by item_len into pool groups.
+
+    Returns list of (start, end) index ranges into kv_data_ptrs / kv_item_lens.
+
+    Uniform models  → [(0, num_layers)]          — single group, no change.
+    V4 multi-pool   → [(0, N_c4), (N_c4, N_tot)] — two groups (c4 + c128).
+    """
+    if not kv_item_lens:
+        return []
+    groups: List[tuple] = []
+    start = 0
+    for i in range(1, len(kv_item_lens)):
+        if kv_item_lens[i] != kv_item_lens[start]:
+            groups.append((start, i))
+            start = i
+    groups.append((start, len(kv_item_lens)))
+    return groups
+
+
+def _pack_extra_pool_indices(arrays: List[npt.NDArray[np.int32]]) -> bytes:
+    """Pack a list of int32 arrays into a single byte string for ZMQ transport.
+
+    Format: uint32 n_arrays, then n_arrays × (uint32 nbytes, raw bytes).
+    """
+    parts = [struct.pack("I", len(arrays))]
+    for arr in arrays:
+        b = arr.astype(np.int32).tobytes()
+        parts.append(struct.pack("I", len(b)))
+        parts.append(b)
+    return b"".join(parts)
+
+
+def _unpack_extra_pool_indices(data: bytes) -> List[npt.NDArray[np.int32]]:
+    """Inverse of _pack_extra_pool_indices."""
+    view = memoryview(data)
+    offset = 0
+    n = struct.unpack_from("I", view, offset)[0]
+    offset += 4
+    arrays = []
+    for _ in range(n):
+        nbytes = struct.unpack_from("I", view, offset)[0]
+        offset += 4
+        arrays.append(np.frombuffer(bytes(view[offset : offset + nbytes]), dtype=np.int32))
+        offset += nbytes
+    return arrays
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -44,6 +92,11 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
+    # Per-pool dst kv indices for V4 multi-pool models (pool groups beyond the first).
+    # Empty for uniform models (backward compat). Index 0 is always dst_kv_indices.
+    dst_kv_indices_extra: List[npt.NDArray[np.int32]] = dataclasses.field(
+        default_factory=list
+    )
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -56,6 +109,12 @@ class TransferInfo:
         else:
             dst_state_indices = []
 
+        # msg[8] (new, V4): extra pool indices packed as:
+        #   uint32 n_extra, then n_extra × (uint32 nbytes, bytes)
+        dst_kv_indices_extra = []
+        if len(msg) > 8 and msg[8] != b"":
+            dst_kv_indices_extra = _unpack_extra_pool_indices(msg[8])
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -65,6 +124,7 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
+            dst_kv_indices_extra=dst_kv_indices_extra,
         )
 
 
@@ -260,6 +320,11 @@ class NixlKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Pool group boundaries: [(start, end), ...] grouping layers by item_len.
+            # Single entry for uniform models; multiple for V4 multi-pool.
+            self._pool_group_boundaries: List[tuple] = _compute_pool_group_boundaries(
+                self.kv_args.kv_item_lens
+            )
             self.use_prepped_transfer = True  # Set to False to fall back to non-prepped path (for debugging).
             if self.use_prepped_transfer:
                 self.prep_handles = {}  # peer_name -> combined KV+state dlist handle
@@ -631,12 +696,18 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         prefill_state_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_state_indices: Optional[npt.NDArray[np.int32]] = None,
+        src_kv_indices_per_pool: Optional[List[npt.NDArray[np.int32]]] = None,
+        dst_kv_indices_per_pool: Optional[List[npt.NDArray[np.int32]]] = None,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
 
         When prefill_state_indices/dst_state_indices are provided, state is bundled
         into the same make_prepped_xfer call using the combined KV+state dlist handle.
+
+        src_kv_indices_per_pool / dst_kv_indices_per_pool: per-pool-group index lists for
+        V4 multi-pool models.  For uniform models these are both [prefill_data_indices] /
+        [dst_data_indices] (a single-element list) and the code path is identical to before.
         """
         # Prepped path: use the combined KV+state dlist handle when available.
         if (
@@ -650,8 +721,33 @@ class NixlKVManager(CommonKVManager):
             slots_per_kv_layer_src = self._slots_per_kv_layer
             slots_per_kv_layer_dst = self._dst_slots_per_kv_layer[peer_name]
 
-            src_kv_flat = repeat_indices_over_layers(prefill_data_indices, slots_per_kv_layer_src)
-            dst_kv_flat = repeat_indices_over_layers(dst_data_indices, slots_per_kv_layer_dst)
+            # Build flat dlist indices per pool group, then concatenate.
+            # For uniform models: single group → same as the old single call.
+            # For V4 multi-pool: each group uses its own src/dst index array.
+            _src_per_pool = src_kv_indices_per_pool or [prefill_data_indices]
+            _dst_per_pool = dst_kv_indices_per_pool or [dst_data_indices]
+            src_parts: List[npt.NDArray] = []
+            dst_parts: List[npt.NDArray] = []
+            src_offset = 0
+            dst_offset = 0
+            for g_idx, (g_start, g_end) in enumerate(self._pool_group_boundaries):
+                src_g = _src_per_pool[min(g_idx, len(_src_per_pool) - 1)]
+                dst_g = _dst_per_pool[min(g_idx, len(_dst_per_pool) - 1)]
+                layer_slots_src = slots_per_kv_layer_src[g_start:g_end]
+                layer_slots_dst = slots_per_kv_layer_dst[g_start:g_end]
+                flat_src = repeat_indices_over_layers(src_g, layer_slots_src)
+                flat_dst = repeat_indices_over_layers(dst_g, layer_slots_dst)
+                if src_offset:
+                    flat_src = (flat_src + src_offset).astype(np.int32)
+                if dst_offset:
+                    flat_dst = (flat_dst + dst_offset).astype(np.int32)
+                src_parts.append(flat_src)
+                dst_parts.append(flat_dst)
+                src_offset += sum(layer_slots_src)
+                dst_offset += sum(layer_slots_dst)
+
+            src_kv_flat = np.concatenate(src_parts) if len(src_parts) > 1 else src_parts[0]
+            dst_kv_flat = np.concatenate(dst_parts) if len(dst_parts) > 1 else dst_parts[0]
 
             if (
                 prefill_state_indices is not None
@@ -761,6 +857,8 @@ class NixlKVManager(CommonKVManager):
         notif: str,
         prefill_state_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_state_indices: Optional[npt.NDArray[np.int32]] = None,
+        src_kv_indices_per_pool: Optional[List[npt.NDArray[np.int32]]] = None,
+        dst_kv_indices_per_pool: Optional[List[npt.NDArray[np.int32]]] = None,
     ):
         return self._send_kvcache_generic(
             peer_name=peer_name,
@@ -773,6 +871,8 @@ class NixlKVManager(CommonKVManager):
             notif=notif,
             prefill_state_indices=prefill_state_indices,
             dst_state_indices=dst_state_indices,
+            src_kv_indices_per_pool=src_kv_indices_per_pool,
+            dst_kv_indices_per_pool=dst_kv_indices_per_pool,
         )
 
     def send_kvcache_slice(
@@ -1172,7 +1272,14 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        kv_indices_extra: Optional[List[npt.NDArray[np.int32]]] = None,
     ):
+        """Issue KV transfers for one chunk.
+
+        kv_indices_extra: per-pool src indices for pool groups beyond the first.
+            None (or []) for uniform models — backward compatible.
+            For V4 multi-pool: kv_indices_extra[i] is the (i+1)-th pool's src indices.
+        """
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or aux_index is not None
 
@@ -1206,6 +1313,13 @@ class NixlKVManager(CommonKVManager):
             else:
                 kv_notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
 
+            # Build per-pool src/dst index lists.
+            # For uniform models: single entry each — no change to logic.
+            # For V4 multi-pool: first pool is kv_indices; extras come from kv_indices_extra
+            # (src) and req.dst_kv_indices_extra (dst).
+            src_kv_indices_per_pool = [kv_indices] + list(kv_indices_extra or [])
+            dst_kv_indices_per_pool = [chunked_dst_kv_indice] + list(req.dst_kv_indices_extra)
+
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                 kv_xfer_handle = self.send_kvcache(
                     req.agent_name,
@@ -1216,6 +1330,8 @@ class NixlKVManager(CommonKVManager):
                     kv_notif,
                     prefill_state_indices=np.array(state_indices, dtype=np.int32) if bundle_state else None,
                     dst_state_indices=np.array(req.dst_state_indices, dtype=np.int32) if bundle_state else None,
+                    src_kv_indices_per_pool=src_kv_indices_per_pool,
+                    dst_kv_indices_per_pool=dst_kv_indices_per_pool,
                 )
             else:
                 kv_xfer_handle = self.send_kvcache_slice(
@@ -1355,7 +1471,14 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        kv_indices_extra: Optional[List[npt.NDArray[np.int32]]] = None,
     ):
+        """Send one KV chunk.
+
+        kv_indices_extra: per-pool src indices for pool groups beyond the first.
+            None for uniform models (backward compat). For V4 multi-pool:
+            kv_indices_extra[i] is the (i+1)-th pool's src page indices.
+        """
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -1380,6 +1503,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            kv_indices_extra,
         )
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
@@ -1418,7 +1542,14 @@ class NixlKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        kv_indices_extra: Optional[List[npt.NDArray[np.int32]]] = None,
     ):
+        """Send transfer metadata to the prefill bootstrap server.
+
+        kv_indices_extra: per-pool dst indices for pool groups beyond the first.
+            None (or []) for uniform models — msg[8] will be b"" (backward compat).
+            For V4 multi-pool: kv_indices_extra[i] is the (i+1)-th pool's dst indices.
+        """
         if self.bootstrap_infos is None:
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -1436,6 +1567,12 @@ class NixlKVReceiver(CommonKVReceiver):
         state_bytes = (
             np.array(state_indices, dtype=np.int32).tobytes()
             if state_indices is not None
+            else b""
+        )
+        # msg[8]: extra pool dst indices (V4 multi-pool). Empty bytes for uniform models.
+        extra_bytes = (
+            _pack_extra_pool_indices(kv_indices_extra)
+            if kv_indices_extra
             else b""
         )
 
@@ -1460,6 +1597,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         aux_index_bytes,
                         required_num_bytes,
                         b"" if is_dummy else state_bytes,
+                        b"" if is_dummy else extra_bytes,
                     ]
                 )
 

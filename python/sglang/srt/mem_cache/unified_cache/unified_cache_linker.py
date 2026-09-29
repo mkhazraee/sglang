@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 import msgspec
 import torch
@@ -65,6 +65,8 @@ class LinkerRequestContext(msgspec.Struct, frozen=True, kw_only=True):
     """What a backend may use to prepare residency for one request attempt."""
 
     request: CacheRequestHandle
+    # Orchestrator KV-hint envelope from the request, or None. Advisory only.
+    router_hint: Optional[Any] = None
 
 
 class UnifiedCacheLinker(ABC):
@@ -292,6 +294,7 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.prepare_request(
                 LinkerRequestContext(
                     request=req.cache_request_handle,
+                    router_hint=getattr(req, "kv_hints", None),
                 ),
                 lookup_transfers,
             )

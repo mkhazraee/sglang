@@ -11,6 +11,13 @@ from typing import Any, Mapping, Optional
 
 import msgspec
 
+from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    MAX_TCP_PORT,
+    split_control_endpoint,
+)
+
+_UNROUTABLE_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
+
 
 class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     """Operator-facing settings for ``--unified-cache-external-linker-backend kvcr``."""
@@ -20,9 +27,19 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     local_dram_bytes_per_worker: int
     pin_local_dram: bool = True
     nixl_backend: str = "UCX"
+    # Peer control channel. control_port is a base; each rank adds its
+    # engine-global attention rank so colocated ranks never collide.
+    control_host: str = "0.0.0.0"
+    control_port: int = 0
+    control_advertise_host: Optional[str] = None
+    enable_remote_hint: bool = False
+
     # KVCR core knobs.
     operation_timeout_ms: int = 20000
     abandon_timeout_ms: int = 60000
+    eager_ctrl_connect: bool = True
+    opportunistic_query: bool = False
+    metadata_retry_interval_ms: int = 100
 
     # Preparation bounds. A request stops waiting at the deadline and admits
     # whatever prefix was confirmed; late completions are drained afterwards.
@@ -45,6 +62,11 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     def __post_init__(self) -> None:
         if self.local_dram_bytes_per_worker <= 0:
             raise ValueError("KVCR linker requires local_dram_bytes_per_worker > 0.")
+        if self.control_port < 0 or self.control_port > MAX_TCP_PORT:
+            raise ValueError(
+                f"KVCR control_port ({self.control_port}) is out of range; use 0 "
+                f"(OS-assigned, local-only) or 1..{MAX_TCP_PORT}."
+            )
         if self.operation_timeout_ms <= 0:
             raise ValueError("KVCR operation_timeout_ms must be positive.")
         if self.abandon_timeout_ms < 2 * self.operation_timeout_ms:
@@ -68,6 +90,33 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(f"KVCR {name} must be positive.")
         if self.poll_interval_ms <= 0:
             raise ValueError("KVCR poll_interval_ms must be positive.")
+        self._validate_remote_hint_endpoint()
+
+    def _validate_remote_hint_endpoint(self) -> None:
+        """A hint source must be dialable before it binds.
+
+        Port 0 exists only inside this process and cannot be advertised, and
+        the bind host is legitimately a wildcard, so remote hints require an
+        explicit advertise host and base port.
+        """
+        if not self.enable_remote_hint:
+            return
+        if self.control_port <= 0:
+            raise ValueError(
+                "KVCR enable_remote_hint requires an explicit control_port: an "
+                "OS-assigned port cannot be registered for peers to dial."
+            )
+        advertise = self.control_advertise_host
+        if not advertise or advertise in _UNROUTABLE_HOSTS:
+            raise ValueError(
+                f"KVCR enable_remote_hint cannot advertise {advertise!r}; set "
+                "control_advertise_host to an address peers can dial."
+            )
+        if split_control_endpoint(f"tcp://{advertise}:{self.control_port}") is None:
+            raise ValueError(
+                f"KVCR control endpoint tcp://{advertise}:{self.control_port} "
+                "is not dialable."
+            )
 
     @classmethod
     def from_extra_config(

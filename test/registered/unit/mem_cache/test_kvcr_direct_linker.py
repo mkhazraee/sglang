@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import json
+import socket
 import time
+from contextlib import nullcontext
+from queue import Empty, SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -34,7 +37,11 @@ from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRLinkerConfig
 from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import KVCRDirectLinker
 from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import restorable_boundaries
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    KVCRFetchHint,
+    KVCRLinkerKeyAdapter,
     encode_object_key,
+    normalize_block_hash,
+    parse_fetch_hint,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LinkerRequestContext,
@@ -50,12 +57,50 @@ PAGE = 2
 LAYERS = 3
 ROW_BYTES = 8
 TIMEOUT_S = 10.0
+# Deliberately unreachable peers cannot prove quiescence. Retain their fake
+# transport harnesses through process exit just as production retains buffers.
+_UNQUIESCED_HARNESSES = []
+
+
+class FakePeerNetwork:
+    """In-process control and notification transport for two real KVCR cores."""
+
+    def __init__(self):
+        self.agents = {}
+        self.controls = {}
+
+    def control(self, endpoint):
+        network = self
+        incoming = self.controls[endpoint] = SimpleQueue()
+
+        class Control:
+            def send(self, endpoint, message):
+                inbox = network.controls.get(endpoint)
+                if inbox is None:
+                    return False
+                inbox.put(message)
+                return True
+
+            def recv(self):
+                messages = []
+                while True:
+                    try:
+                        messages.append(incoming.get_nowait())
+                    except Empty:
+                        return messages
+
+        control = Control()
+        control.endpoint = endpoint
+        return control
 
 
 class FakeNixlAgent:
-    """Loopback NIXL agent: WRITE to self copies bytes; transfers can be held."""
+    """Fake NIXL agent: WRITE copies CPU bytes; transfers can be held."""
 
-    def __init__(self):
+    def __init__(self, network=None):
+        self.network = network
+        self.peer_notifs = SimpleQueue()
+        self.xfer_notifs = {}
         self.name = ""
         self.registrations = []
         self.prep_calls = []
@@ -78,9 +123,12 @@ class FakeNixlAgent:
         self.deregistered.append(handle)
 
     def get_agent_metadata(self):
-        return b"metadata"
+        return self.name.encode() if self.network is not None else b"metadata"
 
     def add_remote_agent(self, metadata):
+        if self.network is not None:
+            assert metadata.decode() in self.network.agents
+            return metadata
         return b"remote"
 
     def get_xfer_descs(self, descs, mem_type="DRAM"):
@@ -134,9 +182,12 @@ class FakeNixlAgent:
         local_descs, remote_descs = list(local_descs), list(remote_descs)
         assert len(local_descs) == len(remote_descs)
         self.xfers.append((op, local_descs, remote_descs, remote_agent))
+        self.xfer_notifs[len(self.xfers)] = notif_msg
         return len(self.xfers)
 
     def transfer(self, handle, notif_msg=b""):
+        if notif_msg:
+            self.xfer_notifs[handle] = notif_msg
         op, local_descs, remote_descs, remote_agent = self.xfers[handle - 1]
         if self.states.get(handle, self.default_state) == "ERR":
             return "ERR"
@@ -147,24 +198,44 @@ class FakeNixlAgent:
         state = self.states.get(handle, self.default_state)
         if state == "DONE" and handle not in self.landed:
             op, local_descs, remote_descs, remote_agent = self.xfers[handle - 1]
-            if op == "WRITE" and remote_agent == self.name:
+            if op == "WRITE" and (
+                remote_agent == self.name
+                or self.network is not None
+                and remote_agent in self.network.agents
+            ):
                 for (src, size, _), (dst, dst_size, _) in zip(
                     local_descs, remote_descs
                 ):
                     assert size == dst_size
                     ctypes.memmove(dst, src, size)
             self.landed.add(handle)
+            if self.xfer_notifs[handle]:
+                self.send_notif(remote_agent, self.xfer_notifs[handle])
         return state
 
     def release_xfer_handle(self, handle):
         self.released.append(handle)
 
     def send_notif(self, agent_name, notif_msg):
-        return None
+        if self.network is not None:
+            self.network.agents[
+                agent_name.decode() if isinstance(agent_name, bytes) else agent_name
+            ].peer_notifs.put((self.name, notif_msg))
 
     def get_new_notifs(self, backends=None):
         notifs, self.notifs = self.notifs, {}
-        return notifs
+        while True:
+            try:
+                sender, message = self.peer_notifs.get_nowait()
+            except Empty:
+                return notifs
+            notifs.setdefault(sender, []).append(message)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _pool_group(*, with_swa: bool, rows: int = 64) -> tuple[DevicePoolGroup, dict]:
@@ -231,9 +302,28 @@ class Harness:
         *,
         with_swa: bool = False,
         extra: dict | None = None,
+        network: FakePeerNetwork | None = None,
     ):
-        _publish_args(extra or {})
-        self.agent = FakeNixlAgent()
+        extra = dict(extra or {})
+        control_patch = nullcontext()
+        if network is not None:
+            port = 26000 + len(network.controls)
+            extra.update(
+                enable_remote_hint=True,
+                control_port=port,
+                control_advertise_host="127.0.0.1",
+            )
+
+            def build_control(linker):
+                control = network.control(f"tcp://127.0.0.1:{port}")
+                linker.control_endpoint = control.endpoint
+                return control
+
+            control_patch = patch.object(
+                KVCRDirectLinker, "_build_control_channel", new=build_control
+            )
+        _publish_args(extra)
+        self.agent = FakeNixlAgent(network)
         self.group, self.buffers = _pool_group(with_swa=with_swa)
         params = SimpleNamespace(
             page_size=PAGE,
@@ -255,6 +345,8 @@ class Harness:
         def factory(config, bindings, backend_configs):
             def make_agent(name, *_):
                 agent.name = name
+                if network is not None:
+                    network.agents[name] = agent
                 return agent
 
             with patch.multiple(
@@ -264,8 +356,13 @@ class Harness:
             ):
                 return KVCR(config, bindings, backend_configs)
 
-        with patch.object(
-            linker_module, "resolve_hybrid_device_pool_group", return_value=self.group
+        with (
+            patch.object(
+                linker_module,
+                "resolve_hybrid_device_pool_group",
+                return_value=self.group,
+            ),
+            control_patch,
         ):
             self.linker = KVCRDirectLinker(
                 None,
@@ -344,14 +441,21 @@ class Harness:
         hashes: list[str],
         *,
         attempt: int = 0,
+        hint=None,
         swa_window: int = 0,
     ):
         handle = CacheRequestHandle(rid=rid, attempt_id=attempt)
         self.linker.prepare_request(
-            LinkerRequestContext(request=handle),
+            LinkerRequestContext(request=handle, router_hint=hint),
             self.lookup_transfers(hashes, swa_window=swa_window),
         )
         return handle
+
+    def hint(self, hashes: list[str]):
+        return KVCRFetchHint(
+            source_control_endpoint=self.linker.control_endpoint,
+            block_hashes=tuple(hash_str_to_int64(page) for page in hashes),
+        ).to_kvcr_hint()
 
     def wait_ready(self, handle: CacheRequestHandle) -> None:
         self.wait(lambda: self.linker.preparation_ready(handle))
@@ -418,7 +522,16 @@ def harness():
 
     yield make
     for h in created:
-        h.close()
+        expected = getattr(h, "expected_close_error", None)
+        if expected is None:
+            h.close()
+            continue
+        core, buffer = h.linker._kvcr, h.linker._local_dram
+        with pytest.raises(RuntimeError, match=expected):
+            h.close()
+        assert h.linker._kvcr is core and h.linker._local_dram is buffer
+        assert not h.linker._closed and h.linker._unhealthy is not None
+        _UNQUIESCED_HARNESSES.append(h)
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +634,60 @@ def test_unprepared_and_unknown_pages_never_hit(harness):
     assert stats.get("prepared_requests", 0) == 0
     # A lookup for a request that was never prepared is a miss, not a hang.
     assert h.linker.lookup("never-prepared", h.lookup_transfers(hashes)) == []
+
+
+def test_hinted_but_absent_pages_never_become_hits(harness):
+    port = _free_port()
+    h = harness(
+        extra={
+            "enable_remote_hint": True,
+            "control_port": port,
+            "control_advertise_host": "127.0.0.1",
+            "preparation_deadline_ms": 300,
+        }
+    )
+    # No peer can acknowledge abandonment, so close must fail closed.
+    h.expected_close_error = "unresolved operations"
+    hashes = _hashes("c", 2)
+    hint = {
+        "protocol_version": "0.1",
+        "message_id": "m",
+        "actions": [
+            {
+                "action_id": "a",
+                "action_type": "kv.fetch",
+                "action_version": "1.0",
+                # A peer that does not exist: nothing ever arrives.
+                "payload": {
+                    "source_control_endpoint": f"tcp://127.0.0.1:{_free_port()}",
+                    "block_hashes": [hash_str_to_int64(x) for x in hashes],
+                },
+            }
+        ],
+    }
+    handle = h.prepare("r3", hashes, hint=hint)
+    started = time.monotonic()
+    h.wait_ready(handle)
+    assert time.monotonic() - started < TIMEOUT_S
+    assert h.linker.lookup("r3", h.lookup_transfers(hashes)) == []
+    stats = h.linker.snapshot_stats()
+    assert stats["hinted_requests"] == 1
+    assert stats.get("prepared_pages", 0) == 0
+    assert stats["prepare_deadlines"] == 1
+    # The dead-peer fetch is abandoned, not assumed finished: it stays tracked
+    # as late work, counted against the abandoned bound, until KVCR's own
+    # operation timeout resolves it as failed. Only then is the accounting
+    # released; the core keeps the destination slots quarantined internally.
+    assert stats["abandoned_bytes"] > 0
+    h.wait(lambda: h.linker.snapshot_stats().get("late_completions", 0) >= 1, timeout=5)
+    late = h.linker.snapshot_stats()
+    assert late["abandoned_bytes"] == 0
+    assert late["kvcr_pending_ops"] == 0
+    assert h.public_claims() == 0
+    # New requests are not blocked by the quarantined work below the bound.
+    other = h.prepare("r3b", _hashes("c2", 1))
+    h.wait_ready(other)
+    assert h.linker.lookup("r3b", h.lookup_transfers(_hashes("c2", 1))) == []
 
 
 def test_partial_pool_success_selects_only_valid_boundaries(harness):
@@ -778,13 +945,72 @@ def test_offload_backpressure_declines_beyond_inflight_bytes(harness):
 # ---------------------------------------------------------------------------
 
 
-def test_full_key_identity_keeps_pool_and_layout_namespace():
+def test_full_key_identity_survives_event_hash_conversion():
     page = "7f" * 32
     for pool in ("kv", "swa"):
         key = encode_object_key(page, "digest", pool)
+        decoded = KVCRLinkerKeyAdapter().decode(key)
+        assert decoded == normalize_block_hash(hash_str_to_int64(page))
         assert key.decode().startswith(page + "#kvcr-linker-v1#digest#")
     # Different digests keep incompatible layouts apart on the full key.
     assert encode_object_key(page, "a", "kv") != encode_object_key(page, "b", "kv")
+
+
+def test_hint_parser_reads_kv_fetch_and_ignores_unknown_actions():
+    envelope = {
+        "protocol_version": "0.1",
+        "message_id": "m",
+        "actions": [
+            {
+                "action_id": "x",
+                "action_type": "kv.other",
+                "action_version": "1.0",
+                "payload": {},
+            },
+            {
+                "action_id": "y",
+                "action_type": "kv.fetch",
+                "action_version": "1.0",
+                "payload": {
+                    "source_control_endpoint": "tcp://h:1",
+                    "block_hashes": [5, -1],
+                },
+            },
+        ],
+    }
+    hint = parse_fetch_hint(envelope)
+    assert hint is not None
+    assert hint.source_control_endpoint == "tcp://h:1"
+    assert hint.block_hashes == (5, (1 << 64) - 1)
+    assert (
+        parse_fetch_hint(
+            {
+                "actions": [
+                    {"action_type": "kv.fetch", "action_version": "2.0", "payload": {}}
+                ]
+            }
+        )
+        is None
+    )
+    assert parse_fetch_hint(None) is None
+    assert parse_fetch_hint({"actions": "nope"}) is None
+    assert (
+        parse_fetch_hint(
+            {
+                "actions": [
+                    {
+                        "action_type": "kv.fetch",
+                        "action_version": "1.0",
+                        "payload": {
+                            "source_control_endpoint": "tcp://h:1",
+                            "block_hashes": ["zz"],
+                        },
+                    }
+                ]
+            }
+        )
+        is None
+    )
 
 
 def test_config_rejects_unknown_and_unsafe_options():
@@ -796,6 +1022,19 @@ def test_config_rejects_unknown_and_unsafe_options():
         )
     with pytest.raises(ValueError, match="requires local_dram_bytes_per_worker"):
         KVCRLinkerConfig.from_extra_config({})
+    with pytest.raises(ValueError, match="explicit control_port"):
+        KVCRLinkerConfig.from_extra_config(
+            {"local_dram_bytes_per_worker": 1, "enable_remote_hint": True}
+        )
+    with pytest.raises(ValueError, match="cannot advertise"):
+        KVCRLinkerConfig.from_extra_config(
+            {
+                "local_dram_bytes_per_worker": 1,
+                "enable_remote_hint": True,
+                "control_port": 25000,
+                "control_advertise_host": "0.0.0.0",
+            }
+        )
     with pytest.raises(ValueError, match="abandon_timeout_ms"):
         KVCRLinkerConfig.from_extra_config(
             {
@@ -1135,6 +1374,49 @@ def test_owner_callback_failure_marks_adapter_unhealthy():
         assert str(errors[0]) == "injected completion callback failure"
     finally:
         assert adapter.stop(TIMEOUT_S)
+
+
+def test_peer_preparation_stages_bytes_before_admission(harness):
+    network = FakePeerNetwork()
+    source = harness(network=network)
+    target = harness(network=network)
+    hashes = _hashes("staged-peer", 1)
+    source.fill(0, 1, seed=29)
+    expected = source.snapshot(0, 1)
+    source.offload(hashes, first_page=0)
+    assert source.wait_offloads(1) == [True]
+    before = len(source.agent.xfers)
+    source.agent.default_state = "PROC"
+    try:
+        handle = target.prepare("staged-peer", hashes, hint=source.hint(hashes))
+        source.wait(lambda: len(source.agent.xfers) == before + 1)
+        assert not target.linker.preparation_ready(handle)
+        assert (
+            target.linker.lookup("staged-peer", target.lookup_transfers(hashes)) == []
+        )
+        assert target.public_claims() == 0 and target.agent.xfers == []
+        source.agent.default_state = "DONE"
+        target.wait_ready(handle)
+        assert target.linker.lookup("staged-peer", target.lookup_transfers(hashes)) == [
+            1
+        ]
+        assert target.public_claims() == 1
+        # The peer wrote staged DRAM; device destinations still need delivery.
+        assert target.agent.xfers == []
+        assert all(
+            not torch.count_nonzero(layer)
+            for layers in target.snapshot(4, 1).values()
+            for layer in layers
+        )
+        target.load("staged-peer", hashes, first_page=4)
+        assert target.wait_loads(1) == [["staged-peer"]]
+        target.wait(lambda: target.public_claims() == 0)
+        for name, layers in target.snapshot(4, 1).items():
+            assert all(
+                torch.equal(got, want) for got, want in zip(layers, expected[name])
+            )
+    finally:
+        source.agent.default_state = "DONE"
 
 
 def test_fetch_completion_rechecks_retirement_after_acquiring_lock():

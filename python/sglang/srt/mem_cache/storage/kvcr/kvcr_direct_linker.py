@@ -7,7 +7,7 @@ Ownership model
   and reads snapshots under ``_lock``; it never touches the KVCR core.
 * One owner thread (``KVCRAdapter``) performs every KVCR call, polls
   completions, and runs deadline/deferred-submission tickers.
-* ``prepare_request`` queries KVCR and issues
+* A source hint is never a hit. ``prepare_request`` queries KVCR and issues
   ``fetch`` for useful candidates, which acquires residency claims; ``lookup``
   then exposes only pages whose claims are held. Claims live until the page is
   delivered to the GPU (or the request is released), so a lookup result cannot
@@ -48,8 +48,12 @@ from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import (
     restorable_boundaries,
 )
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
+    KVCRFetchHint,
+    KVCRLinkerKeyAdapter,
     encode_object_key,
+    offset_control_endpoint,
     page_hash_to_int64,
+    parse_fetch_hint,
     unique_page_hashes_from_keys,
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
@@ -203,6 +207,7 @@ class _Preparation:
         "page_hashes",
         "page_index",
         "pools",
+        "hint",
         "state",
         "deadline",
         "outstanding_ops",
@@ -210,6 +215,7 @@ class _Preparation:
         "restorable",
         "bytes_requested",
         "bytes_confirmed",
+        "peer_hinted",
         "miss_reason",
     )
 
@@ -219,6 +225,7 @@ class _Preparation:
         request_id: str,
         page_hashes: list[str],
         pools: dict[str, _PoolPlan],
+        hint: Optional[KVCRFetchHint],
         deadline: float,
     ) -> None:
         self.handle = handle
@@ -226,6 +233,7 @@ class _Preparation:
         self.page_hashes = page_hashes
         self.page_index = {page: index for index, page in enumerate(page_hashes)}
         self.pools = pools
+        self.hint = hint
         self.state = _State.FETCHING
         self.deadline = deadline
         self.outstanding_ops = 0
@@ -234,6 +242,7 @@ class _Preparation:
         self.restorable: list[int] = []
         self.bytes_requested = 0
         self.bytes_confirmed = 0
+        self.peer_hinted = hint is not None
         self.miss_reason: Optional[str] = None
 
 
@@ -383,7 +392,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._kvcr_factory = _kvcr_factory
         self.agent_name = self._new_agent_name()
         self._framework_regions = self._build_framework_regions()
+        self._key_adapter = KVCRLinkerKeyAdapter()
         self._pinning = _NoFrameworkPinning()
+        self._control = self._build_control_channel()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         # Reentrant: owner-thread completions hold it while releasing claims,
         # and the synchronous release path takes it again to count results.
@@ -551,12 +562,36 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _new_agent_name(self) -> str:
         return f"kvcr-sgl-r{self.world_rank}-{uuid.uuid4().hex[:8]}"
 
+    def _control_port(self) -> int:
+        configured = self.config.control_port
+        if configured <= 0:
+            return 0
+        highest = configured + self.local_ranks * (get_parallel().nnodes or 1) - 1
+        if highest > 65535:
+            raise ValueError(
+                f"KVCR control_port {configured} leaves no room for this engine's "
+                f"ranks: rank {highest - configured} would bind {highest}."
+            )
+        return configured + self.world_rank
+
+    def _build_control_channel(self):
+        if not self.config.enable_remote_hint:
+            return None
+        from kvcr.control_channels import ZmqPeerControlChannel
+
+        port = self._control_port()
+        advertise = self.config.control_advertise_host
+        channel = ZmqPeerControlChannel(self.config.control_host, port, advertise)
+        self.control_endpoint = channel.endpoint
+        return channel
+
     def _build_kvcr(self):
         from kvcr import KVCR, KVCRBindings
         from kvcr.config import (
             KVCRBackendConfigs,
             KVCRConfig,
             LocalDramOptions,
+            RemoteFWDramOptions,
         )
 
         config = KVCRConfig(
@@ -571,6 +606,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             poll_pin_results=self._pinning.poll_pin_results,
             release_pin=self._pinning.release_pin,
             cancel_pin_request=self._pinning.cancel_pin_request,
+            framework_control=self._control,
+            key_adapter=self._key_adapter,
             inventory_sink=self._on_inventory_event,
             on_resilience_event=self._on_resilience_event,
         )
@@ -578,6 +615,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             framework_regions=self._framework_regions,
             local_dram=LocalDramOptions(
                 carve_local_dram(self.plan, self._local_dram),
+                backend=self.config.nixl_backend,
+            ),
+            remote_fw_dram=RemoteFWDramOptions(
+                eager_ctrl_connect=self.config.eager_ctrl_connect,
+                opportunistic_query=self.config.opportunistic_query,
+                metadata_retry_interval_ms=self.config.metadata_retry_interval_ms,
                 backend=self.config.nixl_backend,
             ),
         )
@@ -602,7 +645,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _log_startup(self) -> None:
         logger.info(
             "KVCRDirectLinker rank=%d/%d agent=%s digest=%s pools=%s page_bytes=%d "
-            "page_capacity=%d dram_bytes=%d unused_tail_bytes=%d",
+            "page_capacity=%d dram_bytes=%d unused_tail_bytes=%d remote_hint=%s "
+            "control=%s",
             self.world_rank,
             self.local_ranks,
             self.agent_name,
@@ -612,6 +656,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.plan.page_capacity,
             self.plan.total_bytes,
             self.plan.unused_bytes,
+            self.config.enable_remote_hint,
+            self._control.endpoint if self._control is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -642,6 +688,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         expanded = self.pool_group.resolve_transfers(transfers)
         kv = next((t for t in transfers if t.name == PoolName.KV), None)
         page_hashes = list(kv.keys or []) if kv is not None else []
+        hint = self._aligned_hint(context.router_hint)
         with self._lock:
             previous = self._by_rid.pop(handle.rid, None)
             if previous is not None:
@@ -664,6 +711,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             request_id=f"{handle.rid}#{handle.attempt_id}#{self._generation}",
             page_hashes=page_hashes,
             pools=pools,
+            hint=hint,
             deadline=deadline,
         )
         with self._lock:
@@ -671,11 +719,33 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._by_rid[handle.rid] = prep
             self.stats["prepare_requests"] += 1
             self.stats["queried_pages"] += len(page_hashes)
+            if hint is not None:
+                self.stats["hinted_requests"] += 1
             declined = self._decline_reason_locked()
             if declined is not None:
                 self._mark_miss_locked(prep, declined)
                 return
         self._adapter.post(lambda adapter: self._start_preparation(prep))
+
+    def _aligned_hint(self, envelope: object) -> Optional[KVCRFetchHint]:
+        if envelope is None or not self.config.enable_remote_hint:
+            return None
+        hint = parse_fetch_hint(envelope)
+        if hint is None:
+            with self._lock:
+                self.stats["hints_malformed"] += 1
+            return None
+        # The router resolves the source's DP rank; the within-group attention
+        # rank is this rank's own offset because each rank holds its own shard.
+        offset = self.attn_cp_rank * self.tp_size + self.tp_rank
+        endpoint = offset_control_endpoint(hint.source_control_endpoint, offset)
+        if endpoint is None:
+            with self._lock:
+                self.stats["hints_undialable"] += 1
+            return None
+        return KVCRFetchHint(
+            source_control_endpoint=endpoint, block_hashes=hint.block_hashes
+        )
 
     def _decline_reason_locked(self) -> Optional[str]:
         if self._unhealthy is not None or self._closed:
@@ -704,6 +774,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if prep.state != _State.FETCHING:
                 return
         kvcr = self._adapter.kvcr
+        if prep.hint is not None:
+            try:
+                kvcr.submit_hint(prep.hint.to_kvcr_hint(), request_id=prep.request_id)
+            except Exception:
+                logger.warning("KVCR submit_hint failed", exc_info=True)
+                prep.hint = None
         num_pages = len(prep.page_hashes)
         candidates: dict[str, list[bool]] = {}
         for pool in prep.pools:
@@ -730,6 +806,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if limit <= 0:
                 reason = "no_candidates" if not boundaries else "backpressure_bytes"
                 self._finish_preparation_locked(prep, reason=reason)
+                self._discard_hint(prep)
                 return
             prep.bytes_requested = limit * self._object_bytes
             self._inflight_prepare_bytes += prep.bytes_requested
@@ -759,6 +836,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if prep.outstanding_ops == 0:
             with self._lock:
                 self._finish_preparation_locked(prep, reason="no_candidates")
+            self._discard_hint(prep)
 
     def _fetch_completion(
         self, prep: _Preparation, fetched: list[tuple[str, int, Any]]
@@ -794,6 +872,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 prep.outstanding_ops -= 1
                 if prep.outstanding_ops == 0:
                     self._finish_preparation_locked(prep, reason=None)
+                    finished = True
+                else:
+                    finished = False
+            if finished:
+                self._discard_hint(prep)
 
         return completion
 
@@ -825,8 +908,28 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             prep.restorable = restorable
             self.stats["prepared_requests"] += 1
             self.stats["prepared_pages"] += limit
+            if prep.peer_hinted:
+                self.stats["peer_prepared_pages"] += limit
         else:
             self._mark_miss_locked(prep, reason or "absent")
+
+    def _discard_hint(self, prep: _Preparation) -> None:
+        if prep.hint is None:
+            return
+
+        def discard(adapter: KVCRAdapter) -> None:
+            try:
+                adapter.kvcr.discard_hint(prep.request_id)
+            except Exception:
+                logger.debug("KVCR discard_hint failed", exc_info=True)
+
+        if threading.current_thread() is self._adapter._thread:
+            discard(self._adapter)
+        else:
+            try:
+                self._adapter.post(discard)
+            except RuntimeError:
+                logger.debug("KVCR owner stopped before hint cleanup", exc_info=True)
 
     def _release_handles(self, handles: Iterable[int]) -> None:
         """Release claims on the owner thread; safe to call from any thread."""
@@ -865,6 +968,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         prep.miss_reason = reason
         self._release_handles(list(prep.claims.values()))
         prep.claims = {}
+        self._discard_hint(prep)
 
     def _tick(self, now: float) -> bool:
         """Owner-thread periodic work: deadlines, deferred submissions, stats."""
@@ -888,6 +992,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 )
                 prep.outstanding_ops = 0
                 worked = worked or remaining > 0
+        for prep in expired:
+            self._discard_hint(prep)
         if self._deferred:
             pending, self._deferred = self._deferred, []
             for event, submit in pending:
@@ -1000,6 +1106,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             prep.claims = {}
             prep.state = _State.MISS
             self._release_handles(leftover)
+            self._discard_hint(prep)
             self._pending_loads[rid] = pools
             # The widest pool is the all-pages prefix; trailing-window pools
             # cover a subset of it.
@@ -1387,6 +1494,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.stats["resets"] += 1
         self.agent_name = self._new_agent_name()
         self._framework_regions = self._build_framework_regions()
+        if self._control is not None:
+            self._control = self._build_control_channel()
         self._kvcr = self._build_kvcr()
         self._adapter = self._start_adapter(self._kvcr)
 

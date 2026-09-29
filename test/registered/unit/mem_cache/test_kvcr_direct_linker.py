@@ -624,12 +624,17 @@ def test_framework_registration_matches_page_geometry(rows_are_pages):
         )
 
 
-def test_mamba_restore_copies_checkpoint_and_gates_cow_until_all_spans_land(harness):
+def test_mamba_restore_copies_checkpoint_and_gates_cow_until_all_spans_land(
+    harness, monkeypatch
+):
     import threading
     from unittest.mock import Mock
 
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
+    monkeypatch.setattr(
+        linker_module, "mamba_track_grid", lambda page_size: 2 * page_size
+    )
     group, buffers = _pool_group(with_swa=False)
     states = [torch.zeros(16, width, dtype=torch.uint8) for width in (3, 3, 5, 5)]
     mamba = DevicePoolEntry(

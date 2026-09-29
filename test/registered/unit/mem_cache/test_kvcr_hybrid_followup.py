@@ -3,8 +3,10 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
+from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import plan_capacity
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
@@ -14,6 +16,31 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_sparse_checkpoint_capacity_uses_physical_object_counts():
+    layouts = {
+        "kv": SimpleNamespace(object_bytes=8, labels=("kv:0",), span_sizes=(8,)),
+        "mamba": SimpleNamespace(
+            object_bytes=32, labels=("mamba:0",), span_sizes=(32,)
+        ),
+    }
+    dense = plan_capacity(layouts, 128)
+    sparse = plan_capacity(layouts, 128, capacity_divisors={"mamba": 4})
+    assert dense.pool_capacities == {"kv": 3, "mamba": 3}
+    assert sparse.pool_capacities == {"kv": 8, "mamba": 2}
+    assert sparse.total_bytes == 128
+    assert sparse.pool_layouts == (("kv", 8), ("mamba", 32))
+    assert sparse.pool_bytes == {"kv": 64, "mamba": 64}
+    # Crossing a checkpoint interval requires an entire additional state object.
+    assert (
+        plan_capacity(layouts, 135, capacity_divisors={"mamba": 4}).page_capacity == 8
+    )
+    for divisor in (0, -1, True, 1.5):
+        with pytest.raises(ValueError):
+            plan_capacity(layouts, 128, capacity_divisors={"mamba": divisor})
+    with pytest.raises(ValueError, match="Unknown"):
+        plan_capacity(layouts, 128, capacity_divisors={"missing": 4})
 
 
 def test_mamba_external_transfer_owns_only_its_checkpoint_on_abort():

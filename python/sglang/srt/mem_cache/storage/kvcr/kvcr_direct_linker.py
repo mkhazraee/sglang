@@ -65,6 +65,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_spec,
+    mamba_track_grid,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_device_module
@@ -407,7 +408,17 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._validate_speculative(params)
         self.digest = compatibility_digest_for(self._compatibility_identity())
 
-        self.plan: CapacityPlan = plan_capacity(self.layouts, self._rank_budget_bytes())
+        capacity_divisors = {}
+        if str(PoolName.MAMBA) in self.layouts:
+            track_grid = mamba_track_grid(self.page_size)
+            if track_grid % self.page_size:
+                raise ValueError(
+                    "Mamba checkpoint grid must be divisible by the linker page size."
+                )
+            capacity_divisors[str(PoolName.MAMBA)] = track_grid // self.page_size
+        self.plan: CapacityPlan = plan_capacity(
+            self.layouts, self._rank_budget_bytes(), capacity_divisors=capacity_divisors
+        )
         self._local_dram = torch.empty(
             self.plan.total_bytes,
             dtype=torch.uint8,

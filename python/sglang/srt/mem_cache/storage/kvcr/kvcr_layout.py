@@ -66,7 +66,11 @@ class CapacityPlan(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved per-rank KVCR DRAM allocation."""
 
     budget_bytes: int
+    # Capacity of the all-pages anchor, in cache pages.
     page_capacity: int
+    # Physical-object capacity per pool. Sparse checkpoint pools can have a
+    # smaller capacity than the all-pages KV anchor.
+    pool_capacities: dict[str, int]
     # (pool name, slot bytes) in pool_layouts order.
     pool_layouts: tuple[tuple[str, int], ...]
     # Pool name -> byte length of its region.
@@ -125,37 +129,73 @@ def _layout_for_entry(entry: DevicePoolEntry) -> PoolObjectLayout:
 
 
 def plan_capacity(
-    layouts: Mapping[str, PoolObjectLayout], budget_bytes: int
+    layouts: Mapping[str, PoolObjectLayout],
+    budget_bytes: int,
+    *,
+    capacity_divisors: Mapping[str, int] | None = None,
 ) -> CapacityPlan:
-    """Give every physical pool the same page capacity within the budget.
+    """Size physical pools within one per-rank DRAM budget.
 
-    Every restorable boundary needs a page in every required pool, so a
-    smaller pool would cap all objects; sizing each pool for
-    ``page_capacity`` complete sets of pieces keeps capacities compatible. The remainder
-    below one more page per pool is the reported unused tail.
+    By default every pool stores one object per cache page. A sparse checkpoint
+    pool can provide a divisor ``N`` to reserve one object per ``N`` anchor
+    pages. This matters for hybrid Mamba models: the dense KV anchor is paged at
+    64 tokens while resume state exists only on the 256-token checkpoint grid.
+    Giving both pools the same object count wastes nearly the entire budget on
+    duplicate checkpoint capacity and prematurely caps the KV prefix.
     """
     if budget_bytes <= 0:
         raise ValueError("KVCR linker DRAM budget must be positive.")
-    bytes_per_page = sum(layout.object_bytes for layout in layouts.values())
-    if bytes_per_page <= 0:
+    if not layouts or sum(layout.object_bytes for layout in layouts.values()) <= 0:
         raise ValueError("KVCR linker pool layouts describe no bytes.")
-    page_capacity = budget_bytes // bytes_per_page
+    divisors = {name: 1 for name in layouts}
+    for name, divisor in (capacity_divisors or {}).items():
+        if name not in layouts:
+            raise ValueError(f"Unknown KVCR capacity pool: {name}")
+        if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor <= 0:
+            raise ValueError(
+                f"KVCR capacity divisor for pool {name} must be a positive integer."
+            )
+        divisors[name] = divisor
+
+    def pool_capacity(pool: str, anchor_pages: int) -> int:
+        divisor = divisors[pool]
+        return (anchor_pages + divisor - 1) // divisor
+
+    def required_bytes(anchor_pages: int) -> int:
+        return sum(
+            layout.object_bytes * pool_capacity(name, anchor_pages)
+            for name, layout in layouts.items()
+        )
+
+    # Integer search avoids rounding a sparse pool's final partial interval.
+    low, high = 0, 1
+    while required_bytes(high) <= budget_bytes:
+        low, high = high, high * 2
+    while low + 1 < high:
+        middle = (low + high) // 2
+        if required_bytes(middle) <= budget_bytes:
+            low = middle
+        else:
+            high = middle
+    page_capacity = low
     if page_capacity <= 0:
         raise ValueError(
             f"KVCR linker DRAM budget of {budget_bytes} bytes per rank holds no "
-            f"complete page ({bytes_per_page} bytes across all pools). Raise "
+            "complete page across all pools. Raise "
             "local_dram_bytes_per_worker."
         )
+    pool_capacities = {name: pool_capacity(name, page_capacity) for name in layouts}
     pool_layouts: dict[str, int] = {}
     pool_bytes: dict[str, int] = {}
-    for layout in layouts.values():
+    for name, layout in layouts.items():
         for label, size in zip(layout.labels, layout.span_sizes):
             pool = label.partition(":")[0]
             pool_layouts[pool] = size
-            pool_bytes[pool] = pool_bytes.get(pool, 0) + size * page_capacity
+            pool_bytes[pool] = pool_bytes.get(pool, 0) + size * pool_capacities[name]
     return CapacityPlan(
         budget_bytes=budget_bytes,
         page_capacity=page_capacity,
+        pool_capacities=pool_capacities,
         pool_layouts=tuple(pool_layouts.items()),
         pool_bytes=pool_bytes,
         total_bytes=sum(pool_bytes.values()),

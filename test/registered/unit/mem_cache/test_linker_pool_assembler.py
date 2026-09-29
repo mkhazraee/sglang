@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _dsv4_low_ratio_device_entries,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -654,6 +655,30 @@ class TestPlainKvDevicePoolAssembler(CustomTestCase):
                 params=SimpleNamespace(mtp_draft_device_pools=()),
                 components={ComponentType.FULL},
             )
+
+
+def test_low_ratio_indexer_rows_cover_one_logical_page():
+    kv = SimpleNamespace(kv_buffer=[torch.zeros(4, 8, dtype=torch.uint8)])
+    index = SimpleNamespace(
+        page_size=2,
+        index_k_with_scale_buffer=[torch.zeros(8, 3, dtype=torch.uint8)],
+    )
+    cache = SimpleNamespace(
+        sources_by_ratio={2: [10]},
+        kv_pools={2: kv},
+        index_pools={2: index},
+        start_layer=8,
+    )
+    entries = _dsv4_low_ratio_device_entries(cache, page_size=8)
+    assert [entry.name for entry in entries] == [
+        PoolName.DEEPSEEK_V4_C2,
+        PoolName.DEEPSEEK_V4_C2_INDEXER,
+    ]
+    assert entries[1].layer_mapping == {2: 0}
+    pointers, sizes = entries[1].get_page_buffer_meta(torch.arange(8, 16))
+    assert pointers == [index.index_k_with_scale_buffer[0][2].data_ptr()]
+    assert sizes == [6]
+    assert _dsv4_low_ratio_device_entries(SimpleNamespace(), 8) == []
 
 
 if __name__ == "__main__":

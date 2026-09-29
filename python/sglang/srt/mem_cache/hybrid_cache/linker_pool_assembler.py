@@ -254,6 +254,92 @@ def _with_packed_draft_mapping(
     return result
 
 
+def _dsv4_low_ratio_device_entries(
+    kvcache: Any,
+    page_size: int,
+) -> list[DevicePoolEntry]:
+    """Expose DSV4.1's shared C1/C2 sources in FULL-page units.
+
+    The low-ratio KV pools already store one physical row per FULL page. Their
+    indexer pools can use smaller physical pages, so group those rows into the
+    same FULL-page address space used by linker keys and device indices.
+    """
+    entries = []
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
+        if not sources:
+            continue
+
+        kv_pool = kvcache.kv_pools[ratio]
+        index_pool = kvcache.index_pools[ratio]
+        if kv_pool is None or index_pool is None:
+            raise ValueError(f"DeepSeek V4 C{ratio} source pool is missing.")
+        if page_size % ratio:
+            raise ValueError(
+                f"Tree page size {page_size} must be divisible by C{ratio}."
+            )
+        slots_per_page = page_size // ratio
+        if slots_per_page % index_pool.page_size:
+            raise ValueError(
+                f"C{ratio} index page size {index_pool.page_size} must divide "
+                f"the {slots_per_page} compressed slots in a tree page."
+            )
+        index_pages_per_full_page = slots_per_page // index_pool.page_size
+        layer_mapping = {
+            source - kvcache.start_layer: index for index, source in enumerate(sources)
+        }
+
+        regions = [(names[0], kv_pool, kv_pool.kv_buffer)]
+        if index_pool.index_k_with_scale_buffer is not None:
+            index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
+        else:
+            index_regions = [
+                (names[1], index_pool.index_k_payload_buffer),
+                (names[2], index_pool.index_k_scale_buffer),
+            ]
+        for name, buffers in index_regions:
+            rows = []
+            for buffer in buffers:
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                rows.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .reshape(full_pages, -1)
+                )
+            regions.append((name, index_pool, rows))
+
+        for name, device_pool, buffers in regions:
+            entries.append(
+                DevicePoolEntry(
+                    name=name,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=device_pool,
+                    components=[buffers],
+                    layer_mapping=layer_mapping,
+                    page_size=page_size,
+                    rows_are_pages=True,
+                )
+            )
+    return entries
+
+
 def _build_deepseek_v4_device_pool_group(
     kvcache: Any,
     page_size: int,
@@ -267,7 +353,7 @@ def _build_deepseek_v4_device_pool_group(
         _resolve_deepseek_v4_layer_mappings,
     )
 
-    if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
+    if isinstance(getattr(kvcache, "c4_kv_pool", None), HiSparseC4DevicePool):
         raise ValueError("The direct external linker does not support HiSparse.")
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
@@ -320,31 +406,32 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
-    c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
-    c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
-
-    add(
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.KV,
-        kvcache.c4_kv_pool,
-        c4_buffers,
-        mappings.c4,
-    )
-    for region in _dsv4_indexer_regions(kvcache, page_size):
+    if mappings.c4:
+        c4_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 4)
         add(
-            region.name,
+            PoolName.DEEPSEEK_V4_C4,
             PoolName.KV,
-            kvcache.c4_indexer_kv_pool,
-            region.device_buffers,
+            kvcache.c4_kv_pool,
+            c4_buffers,
             mappings.c4,
         )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        c128_buffers,
-        mappings.c128,
-    )
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add(
+                region.name,
+                PoolName.KV,
+                kvcache.c4_indexer_kv_pool,
+                region.device_buffers,
+                mappings.c4,
+            )
+    if mappings.c128:
+        c128_buffers, _ = _dsv4_compressed_region_buffers(kvcache, 128)
+        add(
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.KV,
+            kvcache.c128_kv_pool,
+            c128_buffers,
+            mappings.c128,
+        )
 
     # fp8 two-pool unified_kv: one row index addresses both kv_buffer (fp8 nope) and
     # kv_buffer_rope (bf16 rope), but unified_region_buffers() above returns the nope
@@ -356,13 +443,15 @@ def _build_deepseek_v4_device_pool_group(
         (128, PoolName.DEEPSEEK_V4_C128_ROPE, kvcache.c128_kv_pool, mappings.c128),
     ):
         rope_region = (
-            kvcache.unified_rope_region_buffers(ratio) if is_unified_kv else None
+            kvcache.unified_rope_region_buffers(ratio)
+            if is_unified_kv and rope_mapping
+            else None
         )
         if rope_region is None:
             continue
         rope_buffers, _ = rope_region
         add(rope_name, PoolName.KV, rope_pool, rope_buffers, rope_mapping)
-    if not is_unified_kv:
+    if not is_unified_kv and mappings.c4_state:
         add(
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.SWA,
@@ -383,6 +472,7 @@ def _build_deepseek_v4_device_pool_group(
             ),
             mappings.c4_state,
         )
+    entries.extend(_dsv4_low_ratio_device_entries(kvcache, page_size))
     return DevicePoolGroup(
         entries,
         mappings.transfer_layer_id_max,

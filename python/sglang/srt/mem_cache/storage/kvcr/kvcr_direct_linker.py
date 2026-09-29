@@ -11,7 +11,9 @@ Ownership model
   ``fetch`` for useful candidates, which acquires residency claims; ``lookup``
   then exposes only pages whose claims are held. Claims live until the page is
   delivered to the GPU (or the request is released), so a lookup result cannot
-  be evicted underneath the load.
+  be evicted underneath the load. Opt-in direct remote restore admits query
+  candidates without a lease and retains their hints for peer-to-GPU delivery;
+  eviction after admission fails the load rather than exposing uncertain bytes.
 """
 
 from __future__ import annotations
@@ -254,11 +256,13 @@ class _LoadPool:
         page_hashes: list[str],
         indices: torch.Tensor,
         claims: list[int],
+        request_id: Optional[str] = None,
     ):
         self.pool = pool
         self.page_hashes = page_hashes
         self.indices = indices
         self.claims = claims
+        self.request_id = request_id
 
 
 class _LoadBatch:
@@ -833,11 +837,34 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         }
         boundaries = restorable_boundaries(candidates, policies, num_pages)
         limit = boundaries[-1] if boundaries else 0
-        # Bound the bytes one request may pull into DRAM.
-        max_pages = self.config.max_prepare_bytes_per_request // max(
-            1, self._object_bytes
-        )
-        limit = min(limit, max_pages)
+        # Direct restore only copies the selected trailing checkpoint/window.
+        if self.config.direct_remote_restore:
+            limit = next(
+                (
+                    end
+                    for end in reversed(boundaries)
+                    if sum(
+                        self.layouts[pool].object_bytes
+                        * (end if plan.policy == "all_pages" else min(end, plan.window))
+                        for pool, plan in prep.pools.items()
+                    )
+                    <= self.config.max_prepare_bytes_per_request
+                ),
+                0,
+            )
+        else:
+            limit = min(
+                limit,
+                self.config.max_prepare_bytes_per_request // max(1, self._object_bytes),
+            )
+        if self.config.direct_remote_restore:
+            with self._lock:
+                for pool, plan in prep.pools.items():
+                    plan.present[:limit] = candidates[pool][:limit]
+                self._finish_preparation_locked(prep, reason=None)
+                if prep.state != _State.READY:
+                    self._discard_hint(prep.request_id)
+            return
         with self._lock:
             if prep.state != _State.FETCHING:
                 return
@@ -846,7 +873,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if limit <= 0:
                 reason = "no_candidates" if not boundaries else "backpressure_bytes"
                 self._finish_preparation_locked(prep, reason=reason)
-                self._discard_hint(prep)
+                self._discard_hint(prep.request_id)
                 return
             prep.bytes_requested = limit * self._object_bytes
             self._inflight_prepare_bytes += prep.bytes_requested
@@ -876,7 +903,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if prep.outstanding_ops == 0:
             with self._lock:
                 self._finish_preparation_locked(prep, reason="no_candidates")
-            self._discard_hint(prep)
+            self._discard_hint(prep.request_id)
 
     def _fetch_completion(
         self, prep: _Preparation, fetched: list[tuple[str, int, Any]]
@@ -916,7 +943,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 else:
                     finished = False
             if finished:
-                self._discard_hint(prep)
+                self._discard_hint(prep.request_id)
 
         return completion
 
@@ -953,13 +980,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         else:
             self._mark_miss_locked(prep, reason or "absent")
 
-    def _discard_hint(self, prep: _Preparation) -> None:
-        if prep.hint is None:
+    def _discard_hint(self, request_id: Optional[str]) -> None:
+        if request_id is None or self._control is None:
             return
 
         def discard(adapter: KVCRAdapter) -> None:
             try:
-                adapter.kvcr.discard_hint(prep.request_id)
+                adapter.kvcr.discard_hint(request_id)
             except Exception:
                 logger.debug("KVCR discard_hint failed", exc_info=True)
 
@@ -1008,7 +1035,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         prep.miss_reason = reason
         self._release_handles(list(prep.claims.values()))
         prep.claims = {}
-        self._discard_hint(prep)
+        self._discard_hint(prep.request_id)
 
     def _tick(self, now: float) -> bool:
         """Owner-thread periodic work: deadlines, deferred submissions, stats."""
@@ -1033,7 +1060,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 prep.outstanding_ops = 0
                 worked = worked or remaining > 0
         for prep in expired:
-            self._discard_hint(prep)
+            self._discard_hint(prep.request_id)
         if self._deferred:
             pending, self._deferred = self._deferred, []
             for event, submit in pending:
@@ -1130,23 +1157,33 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 claims = []
                 for page in pages:
                     index = prep.page_index.get(page)
-                    claim = (
-                        prep.claims.pop((pool, index), None)
-                        if index is not None
-                        else None
-                    )
-                    if claim is None:
+                    if index is None or not prep.pools[pool].present[index]:
+                        raise RuntimeError(
+                            f"KVCR load for rid={rid} pool={pool} page was not prepared"
+                        )
+                    claim = prep.claims.pop((pool, index), None)
+                    if claim is None and not self.config.direct_remote_restore:
                         raise RuntimeError(
                             f"KVCR load for rid={rid} pool={pool} page has no held "
                             "claim; residency was not prepared for this page."
                         )
-                    claims.append(claim)
-                pools.append(_LoadPool(pool, pages, transfer.host_indices, claims))
+                    if claim is not None:
+                        claims.append(claim)
+                pools.append(
+                    _LoadPool(
+                        pool,
+                        pages,
+                        transfer.host_indices,
+                        claims,
+                        prep.request_id if self.config.direct_remote_restore else None,
+                    )
+                )
             leftover = list(prep.claims.values())
             prep.claims = {}
             prep.state = _State.MISS
             self._release_handles(leftover)
-            self._discard_hint(prep)
+            if not self.config.direct_remote_restore or not pools:
+                self._discard_hint(prep.request_id)
             self._pending_loads[rid] = pools
             # The widest pool is the all-pages prefix; trailing-window pools
             # cover a subset of it.
@@ -1215,10 +1252,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 for layer, indices in self._layer_spans[pool.pool].items():
                     for start in range(0, len(pages), chunk):
                         per_layer[layer].append(
-                            {
-                                key: [descriptors[index] for index in indices]
-                                for key, descriptors in pages[start : start + chunk]
-                            }
+                            (
+                                pool.request_id,
+                                {
+                                    key: [descriptors[index] for index in indices]
+                                    for key, descriptors in pages[start : start + chunk]
+                                },
+                            )
                         )
             for layer in range(self.num_layers):
                 operations = per_layer.get(layer, ())
@@ -1229,8 +1269,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         self.layer_done_counter.complete(batch.counter_index, layer)
                     continue
                 batch.layer_outstanding[layer] = len(operations)
-                for blocks in operations:
-                    op = kvcr.deliver(blocks)
+                for request_id, blocks in operations:
+                    op = kvcr.deliver(blocks, request_id=request_id)
                     batch.outstanding += 1
                     self._adapter.track(
                         op, self._load_completion(batch, layer, tuple(blocks))
@@ -1263,6 +1303,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _finish_load(
         self, batch: _LoadBatch, error: Optional[BaseException] = None
     ) -> None:
+        for request_id in {pool.request_id for pool in batch.pools}:
+            self._discard_hint(request_id)
         claims = [claim for pool in batch.pools for claim in pool.claims]
         if batch.success and error is None:
             self.layer_done_counter.complete_all(batch.counter_index)
@@ -1524,6 +1566,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._inflight_prepare_bytes = 0
             self._inflight_offload_bytes = 0
         self._release_handles(handles)
+        for prep in preps:
+            self._discard_hint(prep.request_id)
+        for request_id in {
+            pool.request_id for loads in pending.values() for pool in loads
+        }:
+            self._discard_hint(request_id)
 
     def _stop_core(self) -> None:
         """Quiesce before reusing any registered host or device allocation."""

@@ -1289,12 +1289,13 @@ def test_owner_thread_stats_tick_during_startup_does_not_fault(harness, caplog):
 
 
 @pytest.mark.parametrize("failure", ["entry", "submission"])
+@pytest.mark.parametrize("direct_remote", [False, True])
 def test_delivery_failure_drains_submitted_work_before_releasing_claims(
-    harness, failure
+    harness, failure, direct_remote
 ):
     import threading
 
-    h = harness()
+    h = harness(extra={"direct_remote_restore": direct_remote})
     hashes = _hashes("failure", 2)
     h.fill(0, 2, seed=24)
     h.offload(hashes, first_page=0)
@@ -1324,7 +1325,7 @@ def test_delivery_failure_drains_submitted_work_before_releasing_claims(
         h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
         h.agent.states[first] = "ERR"
         h.wait(lambda: first in h.agent.released)
-    assert h.public_claims() == 2
+    assert h.public_claims() == (0 if direct_remote else 2)
     assert h.linker.num_completed_loads() == 0
     h.agent.default_state = "DONE"
     assert h.wait_loads(1) == [["failure"]]
@@ -1706,6 +1707,142 @@ def test_retired_preparation_does_not_start_fetch_or_charge_bytes(
             assert h.public_claims() == 0
         finally:
             resume.set()
+
+
+@pytest.mark.parametrize("pages", [1, 2, 4])
+def test_direct_budget_counts_only_selected_window(harness, pages):
+    h = harness(
+        with_swa=True,
+        extra={
+            "direct_remote_restore": True,
+            "max_prepare_bytes_per_request": pages
+            * PAGE
+            * ROW_BYTES
+            * (2 * LAYERS + 1),
+        },
+    )
+    hashes = _hashes("direct-budget", 4)
+    h.fill(0, 4, seed=31)
+    h.offload(hashes, first_page=0, swa_tail=4)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("budget", hashes, swa_window=4))
+    assert h.linker.lookup("budget", h.lookup_transfers(hashes, swa_window=4)) == list(
+        range(1, pages + 1)
+    )
+
+
+@pytest.mark.parametrize("evict_source", [False, True])
+def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_source):
+    from kvcr.types import QueryStatus
+
+    network = FakePeerNetwork()
+    source = harness(
+        network=network,
+        extra={
+            "local_dram_bytes_per_worker": PAGE * ROW_BYTES * 2 * LAYERS,
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+        },
+    )
+    target = harness(
+        network=network,
+        extra={
+            "direct_remote_restore": True,
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+        },
+    )
+    hashes = _hashes("peer", 1)
+    source.fill(0, 1, seed=29)
+    expected = source.snapshot(0, 1)
+    source.offload(hashes, first_page=0)
+    assert source.wait_offloads(1) == [True]
+    core = target.linker._kvcr
+    hints = core._core._remote_fw_dram._request_hints
+    keys = [target.linker._key(page, str(PoolName.KV)) for page in hashes]
+
+    with patch.object(core, "fetch", wraps=core.fetch) as fetch:
+        unused = target.prepare("unused", hashes, hint=source.hint(hashes))
+        target.wait_ready(unused)
+        unused_id = target.linker._preparations[unused].request_id
+        assert unused_id in hints
+        target.linker.release_request("unused")
+        target.wait(lambda: unused_id not in hints)
+
+        handle = target.prepare("peer", hashes, hint=source.hint(hashes))
+        target.wait_ready(handle)
+        request_id = target.linker._preparations[handle].request_id
+        assert target.linker.lookup("peer", target.lookup_transfers(hashes)) == [1]
+        fetch.assert_not_called()
+        assert target.public_claims() == 0 and target.agent.xfers == []
+        assert core.query(keys) == [(QueryStatus.MISS, None)]
+        assert request_id in hints
+
+        if evict_source:
+            source.fill(1, 1, seed=30)
+            source.offload(_hashes("replacement", 1), first_page=1)
+            assert source.wait_offloads(1) == [True]
+            assert source.linker._kvcr.query(keys) == [(QueryStatus.MISS, None)]
+        else:
+            source.agent.default_state = "PROC"
+        first = len(source.agent.xfers) + 1
+        try:
+            index = target.load("peer", hashes, first_page=4)
+            futures = target.linker.layer_done_counter.futures[index]
+            if not evict_source:
+                source.wait(lambda: len(source.agent.xfers) == first + LAYERS - 1)
+                layer_zero_address = target.buffers["k"][0][4 * PAGE].data_ptr()
+                first_layer = next(
+                    number
+                    for number in range(first, first + LAYERS)
+                    if any(
+                        address == layer_zero_address
+                        for address, _, _ in source.agent.xfers[number - 1][2]
+                    )
+                )
+                source.agent.states[first_layer] = "DONE"
+                target.wait(lambda: futures[0].done())
+                assert futures[0].exception() is None
+                assert not futures[1].done() and not futures[2].done()
+                for name, layers in target.snapshot(4, 1).items():
+                    assert torch.equal(layers[0], expected[name][0])
+                    assert not torch.count_nonzero(layers[1])
+                    assert not torch.count_nonzero(layers[2])
+                assert target.linker.num_completed_loads() == 0
+                assert request_id in hints
+                source.agent.default_state = "DONE"
+            assert target.wait_loads(1) == [["peer"]]
+            target.wait(lambda: request_id not in hints)
+            fetch.assert_not_called()
+            assert target.public_claims() == 0 and target.agent.xfers == []
+            assert core.query(keys) == [(QueryStatus.MISS, None)]
+            target.linker.layer_done_counter.set_consumer(index)
+            if evict_source:
+                with pytest.raises(RuntimeError, match="layer-wise KV load failed"):
+                    target.linker.layer_done_counter.wait_until(LAYERS - 1)
+                assert target.linker._unhealthy is not None
+                assert all(
+                    not torch.count_nonzero(layer)
+                    for layers in target.snapshot(4, 1).values()
+                    for layer in layers
+                )
+            else:
+                target.linker.layer_done_counter.wait_until(LAYERS - 1)
+                for name, layers in target.snapshot(4, 1).items():
+                    assert all(
+                        torch.equal(got, want)
+                        for got, want in zip(layers, expected[name])
+                    )
+                source.wait(
+                    lambda: (
+                        source.linker._kvcr._core._block_record_map[
+                            keys[0]
+                        ].local_dram.claim_count
+                        == 0
+                    )
+                )
+        finally:
+            source.agent.default_state = "DONE"
 
 
 if __name__ == "__main__":

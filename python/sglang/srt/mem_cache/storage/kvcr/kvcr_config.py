@@ -29,6 +29,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     nixl_backend: str = "UCX"
     # False keeps the same transfers but releases compute after the entire load.
     progressive_restore: bool = True
+    # Experimental: query does not reserve peer objects until delivery starts.
+    direct_remote_restore: bool = False
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.
     control_host: str = "0.0.0.0"

@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
@@ -664,9 +665,75 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value.to(torch.int64),
+                keys=[node.hash_value[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+
+        # One checkpoint belongs to the exact stop boundary.  During lookup a
+        # one-key trailing policy tells the backend to test every candidate
+        # page independently; the backend derives those candidates from the KV
+        # anchor.  Once a boundary is selected, LOAD needs only its final key.
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=[keys[-1]],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
+        if phase == LinkerTransferPhase.LOAD:
+            transfer.device_indices = self._alloc_mamba_slot().to(torch.int64)
+        return transfer
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
+            # Assembly abort runs before PREPARE. Only this transfer's new
+            # checkpoint belongs to us; preserve any existing request state.
+            self._free_mamba_value(transfer.device_indices[:1])
+            return None
+
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            if not req.kv.holds_mamba:
+                dst = self._alloc_mamba_slot()
+                req.kv.mamba_pool_idx = dst[0]
+            # The external copy lands in the tree checkpoint slot.  Clone it
+            # into the request-owned mutable slot on the forward stream after
+            # the layer-wise load reaches all Mamba state spans.
+            req.kv.mamba_cow_src_index = transfer.device_indices[:1]
+            req.kv.mamba_needs_clear = False
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        assert insert_result is not None
+        node = self.tree_core.node_by_id(insert_result.last_device_node)
+        canonical = node.component_data[self.component_type].value
+        assert canonical is not None
+        req.kv.mamba_cow_src_index = canonical
+        # If an equivalent checkpoint was already present, the wrapper has
+        # returned this transfer's duplicate slot to the allocator.  Do not
+        # queue remote DMA into that freed slot.
+        if insert_result.mamba_exist:
+            return None
+        return transfer
 
     # ---- HiCache Hooks ----
 

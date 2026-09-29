@@ -27,6 +27,7 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     local_dram_bytes_per_worker: int
     pin_local_dram: bool = True
     nixl_backend: str = "UCX"
+    eviction_policy: str = "lru"
     # Experimental: query does not reserve peer objects until delivery starts.
     direct_remote_restore: bool = False
     # Peer control channel. control_port is a base; each rank adds its
@@ -65,6 +66,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     def __post_init__(self) -> None:
         if self.local_dram_bytes_per_worker <= 0:
             raise ValueError("KVCR linker requires local_dram_bytes_per_worker > 0.")
+        if self.eviction_policy not in ("lru", "fifo"):
+            raise ValueError("KVCR eviction_policy must be 'lru' or 'fifo'.")
         if self.control_port < 0 or self.control_port > MAX_TCP_PORT:
             raise ValueError(
                 f"KVCR control_port ({self.control_port}) is out of range; use 0 "

@@ -525,6 +525,43 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     assert stats["gpu_restore_bytes"] == stats["offload_bytes"]
 
 
+@pytest.mark.parametrize(("policy", "evicted_index"), [("fifo", 0), ("lru", 1)])
+def test_configured_eviction_policy_selects_victim(harness, policy, evicted_index):
+    from kvcr.types import CacheTier, QueryStatus
+
+    h = harness(
+        extra={
+            "local_dram_bytes_per_worker": 2 * PAGE * ROW_BYTES * 2 * LAYERS,
+            "eviction_policy": policy,
+        }
+    )
+    hashes = _hashes("policy", 3)
+    h.fill(0, 3, seed=37)
+    h.offload(hashes[:2], first_page=0)
+    assert h.wait_offloads(1) == [True]
+
+    # A is accessed most recently, but becomes evictable before B. FIFO
+    # orders claim releases; LRU orders accesses regardless of release order.
+    for index in (1, 0):
+        handle = h.prepare(f"policy-{index}", [hashes[index]])
+        h.wait_ready(handle)
+        assert h.linker.lookup(
+            f"policy-{index}", h.lookup_transfers([hashes[index]])
+        ) == [1]
+    assert h.public_claims() == 2
+    for index in (0, 1):
+        h.linker.release_request(f"policy-{index}")
+        h.wait(lambda: h.public_claims() == 1 - index)
+
+    h.offload(hashes[2:], first_page=2)
+    assert h.wait_offloads(1) == [True]
+    expected = [(QueryStatus.HIT, CacheTier.LOCAL_G2)] * 3
+    expected[evicted_index] = (QueryStatus.MISS, None)
+    assert (
+        h.linker._kvcr.query([h.linker._key(page, "kv") for page in hashes]) == expected
+    )
+
+
 def test_unprepared_and_unknown_pages_never_hit(harness):
     h = harness()
     hashes = _hashes("b", 3)
@@ -947,6 +984,11 @@ def test_hint_parser_reads_kv_fetch_and_ignores_unknown_actions():
 
 
 def test_config_rejects_unknown_and_unsafe_options():
+    assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).eviction_policy == "lru"
+    with pytest.raises(ValueError, match="eviction_policy"):
+        KVCRLinkerConfig.from_extra_config(
+            {"local_dram_bytes_per_worker": 1, "eviction_policy": "random"}
+        )
     with pytest.raises(ValueError, match="unknown options"):
         KVCRLinkerConfig.from_extra_config({"local_dram_bytes": 1})
     with pytest.raises(ValueError, match="unknown options"):

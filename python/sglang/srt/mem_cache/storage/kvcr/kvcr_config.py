@@ -27,6 +27,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     local_dram_bytes_per_worker: int
     pin_local_dram: bool = True
     nixl_backend: str = "UCX"
+    # False keeps the same transfers but releases compute after the entire load.
+    progressive_restore: bool = True
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.
     control_host: str = "0.0.0.0"

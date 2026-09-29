@@ -269,6 +269,7 @@ class _LoadBatch:
         "outstanding",
         "success",
         "bytes",
+        "layer_outstanding",
         "error",
     )
 
@@ -282,6 +283,7 @@ class _LoadBatch:
         self.outstanding = 0
         self.success = True
         self.bytes = 0
+        self.layer_outstanding: dict[int, int] = {}
         self.error: BaseException | None = None
 
 
@@ -335,6 +337,28 @@ def _pool_policy(transfer: PoolTransfer) -> tuple[str, int]:
     if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
         return ("trailing_pages", max(1, len(transfer.keys or ())))
     return ("all_pages", 0)
+
+
+def _layer_span_indices(
+    pool_group, num_layers: int
+) -> dict[str, dict[int, tuple[int, ...]]]:
+    """Assign each stored span to its first consuming logical layer."""
+    result = {}
+    for entry in pool_group.entries:
+        first_layer = {}
+        for layer, mapped in entry.layer_mapping.items():
+            for index in [mapped] if isinstance(mapped, int) else mapped:
+                first_layer[index] = min(first_layer.get(index, layer), layer)
+        layers = collections.defaultdict(list)
+        span = 0
+        for component in entry.buffer_meta:
+            for index in range(len(component)):
+                layers[first_layer.get(index, num_layers - 1)].append(span)
+                span += 1
+        result[str(entry.name)] = {
+            layer: tuple(indices) for layer, indices in layers.items()
+        }
+    return result
 
 
 class KVCRDirectLinker(UnifiedCacheLinker):
@@ -395,6 +419,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._key_adapter = KVCRLinkerKeyAdapter()
         self._pinning = _NoFrameworkPinning()
         self._control = self._build_control_channel()
+        self._layer_spans = _layer_span_indices(self.pool_group, self.num_layers)
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -1161,9 +1186,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._deferred.append((event, submit))
 
     def _submit_load(self, batch: _LoadBatch) -> None:
-        """Deliver whole claimed objects before releasing the model barrier."""
+        """Deliver claimed objects by logical layer through public KVCR calls."""
         kvcr = self._adapter.kvcr
         try:
+            per_layer = collections.defaultdict(list)
             chunk = self.config.fetch_chunk_pages
             for pool in batch.pools:
                 rows = self._rows(pool.pool, pool.indices)
@@ -1171,32 +1197,53 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     raise RuntimeError(
                         f"KVCR load pool={pool.pool} rows do not match pages"
                     )
-                for start in range(0, len(rows), chunk):
-                    blocks = {
-                        self._key(page, pool.pool): self._descriptors(pool.pool, row)
-                        for page, row in zip(
-                            pool.page_hashes[start : start + chunk],
-                            rows[start : start + chunk],
+                pages = [
+                    (self._key(page, pool.pool), self._descriptors(pool.pool, row))
+                    for page, row in zip(pool.page_hashes, rows)
+                ]
+                for layer, indices in self._layer_spans[pool.pool].items():
+                    for start in range(0, len(pages), chunk):
+                        per_layer[layer].append(
+                            {
+                                key: [descriptors[index] for index in indices]
+                                for key, descriptors in pages[start : start + chunk]
+                            }
                         )
-                    }
+            for layer in range(self.num_layers):
+                operations = per_layer.get(layer, ())
+                if not operations:
+                    # A shared span belongs to its earliest consumer. The
+                    # sequential forward pass waits there before later layers.
+                    if self.config.progressive_restore:
+                        self.layer_done_counter.complete(batch.counter_index, layer)
+                    continue
+                batch.layer_outstanding[layer] = len(operations)
+                for blocks in operations:
                     op = kvcr.deliver(blocks)
                     batch.outstanding += 1
-                    self._adapter.track(op, self._load_completion(batch, tuple(blocks)))
+                    self._adapter.track(
+                        op, self._load_completion(batch, layer, tuple(blocks))
+                    )
         except Exception as error:
             batch.success = False
             batch.error = error
             logger.exception("KVCR load submission failed")
-        # Accepted transfers must drain before their claims can be released.
+        # Submission failure does not cancel already accepted transfers. Keep
+        # every fetch claim until their ordinary completions have drained.
         if batch.outstanding == 0:
             self._finish_load(batch, error=batch.error)
 
-    def _load_completion(self, batch: _LoadBatch, keys: tuple):
+    def _load_completion(self, batch: _LoadBatch, layer: int, keys: tuple):
         def completion(entries: Mapping[Any, Any]) -> None:
             batch.success = batch.success and all(
                 (entry := entries.get(key)) is not None and entry.success
                 for key in keys
             )
             batch.outstanding -= 1
+            batch.layer_outstanding[layer] -= 1
+            if batch.layer_outstanding[layer] == 0 and batch.success:
+                if self.config.progressive_restore:
+                    self.layer_done_counter.complete(batch.counter_index, layer)
             if batch.outstanding == 0:
                 self._finish_load(batch, error=batch.error)
 

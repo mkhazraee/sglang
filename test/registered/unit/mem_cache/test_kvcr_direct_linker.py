@@ -1289,7 +1289,7 @@ def test_delivery_failure_drains_submitted_work_before_releasing_claims(
 ):
     import threading
 
-    h = harness(extra={"fetch_chunk_pages": 1})
+    h = harness()
     hashes = _hashes("failure", 2)
     h.fill(0, 2, seed=24)
     h.offload(hashes, first_page=0)
@@ -1307,7 +1307,7 @@ def test_delivery_failure_drains_submitted_work_before_releasing_claims(
             calls += 1
             if calls == 2:
                 attempted.set()
-                raise RuntimeError("injected second-chunk submission failure")
+                raise RuntimeError("injected second-layer submission failure")
             return deliver(*args, **kwargs)
 
         with patch.object(h.linker._kvcr, "deliver", side_effect=fail_second):
@@ -1316,7 +1316,7 @@ def test_delivery_failure_drains_submitted_work_before_releasing_claims(
         h.wait(lambda: len(h.agent.xfers) == first)
     else:
         index = h.load("failure", hashes, first_page=4)
-        h.wait(lambda: len(h.agent.xfers) == first + 1)
+        h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
         h.agent.states[first] = "ERR"
         h.wait(lambda: first in h.agent.released)
     assert h.public_claims() == 2
@@ -1370,7 +1370,7 @@ def test_drain_waits_for_queued_load_submission(harness):
         drain.join(0.05)
         assert drain.is_alive()
         unblock.set()
-        h.wait(lambda: len(h.agent.xfers) == first)
+        h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
         assert h.public_claims() == 2 and drain.is_alive()
         h.agent.default_state = "DONE"
         drain.join(TIMEOUT_S)
@@ -1392,7 +1392,7 @@ def test_reset_retains_core_buffers_and_claims_when_delivery_has_not_drained(har
     h.agent.default_state = "PROC"
     first = len(h.agent.xfers) + 1
     h.load("reset-drain", hashes, first_page=4)
-    h.wait(lambda: len(h.agent.xfers) == first)
+    h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
     core, buffer, adapter = h.linker._kvcr, h.linker._local_dram, h.linker._adapter
     drain = h.linker._drain
     with patch.object(h.linker, "_drain", side_effect=lambda timeout: drain(0.02)):
@@ -1409,47 +1409,6 @@ def test_reset_retains_core_buffers_and_claims_when_delivery_has_not_drained(har
     assert h.linker._unhealthy is None
     h.close()
     assert h.linker._closed
-
-
-def test_whole_object_load_waits_for_every_chunk(harness):
-    import threading
-
-    h = harness()
-    hashes = _hashes("whole-object", 4)
-    h.fill(0, 4, seed=22)
-    expected = h.snapshot(0, 4)
-    h.offload(hashes, first_page=0)
-    assert h.wait_offloads(1) == [True]
-    h.wait_ready(h.prepare("whole-object", hashes))
-    first = len(h.agent.xfers) + 1
-    h.agent.default_state = "PROC"
-    try:
-        index = h.load("whole-object", hashes, first_page=8)
-        # Two chunks, each carrying every layer of its two page objects.
-        h.wait(lambda: len(h.agent.xfers) == first + 1)
-        futures = h.linker.layer_done_counter.futures[index]
-        h.agent.states[first] = "DONE"
-        h.wait(lambda: h.linker._adapter.pending_ops == 1)
-        observed = threading.Event()
-        h.linker._adapter.post(lambda adapter: observed.set())
-        assert observed.wait(TIMEOUT_S)
-        assert not any(future.done() for future in futures)
-        assert h.public_claims() == 4
-        assert h.linker.num_completed_loads() == 0
-        for name, layers in h.snapshot(8, 4).items():
-            for got, want in zip(layers, expected[name]):
-                assert torch.equal(got[: 2 * PAGE], want[: 2 * PAGE])
-                assert not torch.count_nonzero(got[2 * PAGE :])
-        h.agent.default_state = "DONE"
-        assert h.wait_loads(1) == [["whole-object"]]
-        h.wait(lambda: h.public_claims() == 0)
-        assert all(future.done() and future.exception() is None for future in futures)
-        for name, layers in h.snapshot(8, 4).items():
-            assert all(
-                torch.equal(got, want) for got, want in zip(layers, expected[name])
-            )
-    finally:
-        h.agent.default_state = "DONE"
 
 
 def test_owner_callback_failure_marks_adapter_unhealthy():
@@ -1528,6 +1487,131 @@ def test_peer_preparation_stages_bytes_before_admission(harness):
             )
     finally:
         source.agent.default_state = "DONE"
+
+
+@pytest.mark.parametrize("progressive_restore", [False, True])
+def test_layer_delivery_releases_early_layer_and_holds_claims_until_all_drain(
+    harness, progressive_restore
+):
+    import threading
+
+    h = harness(extra={"progressive_restore": progressive_restore})
+    hashes = _hashes("layers", 2)
+    h.fill(0, 2, seed=22)
+    expected = h.snapshot(0, 2)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("layers", hashes))
+    first = len(h.agent.xfers) + 1
+    h.agent.default_state = "PROC"
+    index = h.load("layers", hashes, first_page=4)
+    h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
+    # Both modes submit the identical per-layer NIXL descriptor lists.
+    for layer, transfer in enumerate(h.agent.xfers[first - 1 :]):
+        destinations = {address for address, _, _ in transfer[2]}
+        assert destinations == {
+            h.buffers[name][layer][page * PAGE].data_ptr()
+            for name in ("k", "v")
+            for page in (4, 5)
+        }
+    futures = h.linker.layer_done_counter.futures[index]
+    assert h.public_claims() == 2
+    assert not any(f.done() for f in futures)
+    h.agent.states[first] = "DONE"
+    h.wait(lambda: h.linker._adapter.pending_ops == LAYERS - 1)
+    observed = threading.Event()
+    h.linker._adapter.post(lambda adapter: observed.set())
+    assert observed.wait(TIMEOUT_S)
+    assert futures[0].done() is progressive_restore
+    assert not futures[1].done() and not futures[2].done()
+    restored = h.snapshot(4, 2)
+    for name in ("k", "v"):
+        assert torch.equal(restored[name][0], expected[name][0])
+        assert torch.count_nonzero(restored[name][1]) == 0
+        assert torch.count_nonzero(restored[name][2]) == 0
+    assert h.public_claims() == 2 and h.linker.num_completed_loads() == 0
+    h.agent.default_state = "DONE"
+    assert h.wait_loads(1) == [["layers"]]
+    h.wait(lambda: h.public_claims() == 0)
+    assert all(future.done() and future.exception() is None for future in futures)
+    for name, layers in h.snapshot(4, 2).items():
+        assert all(torch.equal(got, want) for got, want in zip(layers, expected[name]))
+
+
+def test_layer_waits_for_every_request_and_chunk(harness):
+    h = harness()
+    hashes = _hashes("joined-layers", 4)
+    h.fill(0, 4, seed=23)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    for rid in ("a", "b"):
+        h.wait_ready(h.prepare(rid, hashes))
+        assert h.linker.load(
+            rid,
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    keys=hashes,
+                    device_indices=h.page_indices(8 if rid == "a" else 16, 4),
+                )
+            ],
+        )
+    first = len(h.agent.xfers) + 1
+    h.agent.default_state = "PROC"
+    index = h.linker.start_layer_wise_loading()
+    h.wait(lambda: len(h.agent.xfers) == first + 12 - 1)
+    futures = h.linker.layer_done_counter.futures[index]
+    # Two requests, two page chunks each: all four transfers gate layer zero.
+    for handle in range(first, first + 3):
+        h.agent.states[handle] = "DONE"
+    h.wait(
+        lambda: all(handle in h.agent.released for handle in range(first, first + 3))
+    )
+    assert not futures[0].done()
+    h.agent.states[first + 3] = "DONE"
+    h.wait(lambda: futures[0].done())
+    assert not futures[1].done() and h.public_claims() == 8
+    h.agent.default_state = "DONE"
+    assert h.wait_loads(1) == [["a", "b"]]
+    h.wait(lambda: h.public_claims() == 0)
+
+
+def test_wait_for_later_layer_also_waits_for_incomplete_earlier_layers(harness):
+    import threading
+
+    h = harness()
+    hashes = _hashes("out-of-order", 2)
+    h.fill(0, 2, seed=27)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("out-of-order", hashes))
+    first = len(h.agent.xfers) + 1
+    h.agent.default_state = "PROC"
+    index = h.load("out-of-order", hashes, first_page=4)
+    h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
+    for handle in range(first + 1, first + LAYERS):
+        h.agent.states[handle] = "DONE"
+    futures = h.linker.layer_done_counter.futures[index]
+    h.wait(lambda: futures[-1].done())
+    h.linker.layer_done_counter.set_consumer(index)
+    ready = threading.Event()
+
+    def wait_all_layers():
+        h.linker.layer_done_counter.wait_until(LAYERS - 1)
+        ready.set()
+
+    waiter = threading.Thread(target=wait_all_layers)
+    waiter.start()
+    try:
+        assert not ready.wait(0.05)
+        assert h.public_claims() == 2
+        h.agent.states[first] = "DONE"
+        assert ready.wait(TIMEOUT_S)
+        assert h.wait_loads(1) == [["out-of-order"]]
+        h.wait(lambda: h.public_claims() == 0)
+    finally:
+        h.agent.default_state = "DONE"
+        waiter.join(TIMEOUT_S)
 
 
 def test_fetch_completion_rechecks_retirement_after_acquiring_lock():

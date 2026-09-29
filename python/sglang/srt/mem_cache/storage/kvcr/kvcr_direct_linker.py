@@ -708,6 +708,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             LocalDramOptions,
             RemoteFWDramOptions,
         )
+        from kvcr.policy import FIFOPolicy, LRUPolicy
 
         config = KVCRConfig(
             nixl_agent_name=self.agent_name,
@@ -725,6 +726,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             framework_control=self._control,
             key_adapter=self._key_adapter,
             inventory_sink=self._on_inventory_event,
+            policy=LRUPolicy()
+            if self.config.eviction_policy == "lru"
+            else FIFOPolicy(),
             on_resilience_event=self._on_resilience_event,
             stats_factory=(lambda: self._telemetry)
             if self._telemetry is not None
@@ -765,7 +769,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         logger.info(
             "KVCRDirectLinker rank=%d/%d agent=%s digest=%s pools=%s page_bytes=%d "
             "page_capacity=%d dram_bytes=%d unused_tail_bytes=%d remote_hint=%s "
-            "control=%s restore_mode=%s progressive_restore=%s nixl_backend=%s "
+            "control=%s eviction_policy=%s restore_mode=%s progressive_restore=%s nixl_backend=%s "
             "pool_capacities=%s",
             self.world_rank,
             self.local_ranks,
@@ -778,6 +782,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.plan.unused_bytes,
             self.config.enable_remote_hint,
             self._control.endpoint if self._control is not None else None,
+            self.config.eviction_policy,
             "direct_remote" if self.config.direct_remote_restore else "staged",
             self.config.progressive_restore,
             self.config.nixl_backend,

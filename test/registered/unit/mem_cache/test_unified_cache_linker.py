@@ -1008,6 +1008,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        drain_external_inventory=lambda: None,
     )
 
     reduce_calls = 0
@@ -1340,3 +1341,23 @@ def test_linker_load_preserves_swa_boundaries(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_preparation_readiness_is_intersected_across_ranks():
+    class PreparingLinker(_FakeLinker):
+        prepares_requests = True
+
+        def preparation_ready(self, request):
+            return request != "pending"
+
+    def remote_readiness(mask, op):
+        mask[1] = 0
+
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=remote_readiness), PreparingLinker()
+    )
+    reqs = [
+        SimpleNamespace(rid=rid, cache_request_handle=rid)
+        for rid in ("ready", "remote_pending", "pending")
+    ]
+    assert wrapper.sync_preparation(reqs) == {"ready"}

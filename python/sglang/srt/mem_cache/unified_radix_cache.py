@@ -361,6 +361,17 @@ class UnifiedRadixCache(BasePrefixCache):
         """Attach an external KV store directly to the device pools."""
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def prepare_linker_request(self, req: Req) -> None:
+        """Start external residency preparation for a newly queued request."""
+        if self.linker is not None:
+            self.linker.prepare_request(req)
+
+    def sync_linker_preparation(self, reqs: Sequence[Req]) -> Optional[set[str]]:
+        """Request IDs admissible this pass, or None when no gating applies."""
+        if self.linker is None or not self.linker.prepares_requests:
+            return None
+        return self.linker.sync_preparation(reqs)
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
@@ -989,6 +1000,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
+        if self.linker is not None:
+            self.linker.finish_request(req.rid)
         return self.session.try_cache_finished_req(req)
 
     @rank_consensus(same_params=["req.rid", "inserted"])
@@ -3399,6 +3412,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            self.linker.drain_external_inventory()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

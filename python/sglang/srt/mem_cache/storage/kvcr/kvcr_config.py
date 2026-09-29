@@ -42,6 +42,7 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     eager_ctrl_connect: bool = True
     opportunistic_query: bool = False
     metadata_retry_interval_ms: int = 100
+    enable_telemetry: bool = False
 
     # Preparation bounds. A request stops waiting at the deadline and admits
     # whatever prefix was confirmed; late completions are drained afterwards.

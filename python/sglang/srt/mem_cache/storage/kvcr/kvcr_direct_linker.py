@@ -159,6 +159,52 @@ class LayerWiseLoadCounter:
             self.futures.clear()
 
 
+class _LinkerTelemetry:
+    """Thread-safe totals per fixed metric/label series; no samples or request IDs.
+
+    KVCR's factory reuses this sink; snapshots copy totals without adding them.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counters = collections.defaultdict(float)
+        self._gauges = {}
+        self._histograms = collections.defaultdict(lambda: [0, 0.0, 0.0])
+
+    @staticmethod
+    def _key(name: str, labelvalues: tuple[str, ...]) -> str:
+        return name + ("[" + ",".join(labelvalues) + "]" if labelvalues else "")
+
+    def increase_counter(self, name, value, labelvalues=()) -> None:
+        with self._lock:
+            self._counters[self._key(name, labelvalues)] += value
+
+    def set_gauge(self, name, value, labelvalues=()) -> None:
+        with self._lock:
+            self._gauges[self._key(name, labelvalues)] = value
+
+    def observe_histogram(self, name, value, labelvalues=()) -> None:
+        with self._lock:
+            summary = self._histograms[self._key(name, labelvalues)]
+            summary[0] += 1
+            summary[1] += value
+            summary[2] = max(summary[2], value)
+
+    def reduce(self) -> dict[str, int | float]:
+        with self._lock:
+            result = dict(self._counters)
+            result.update(self._gauges)
+            for name, (count, total, peak) in self._histograms.items():
+                result[f"{name}_count"] = count
+                result[f"{name}_sum"] = total
+                result[f"{name}_max"] = peak
+            return result
+
+    def is_empty(self) -> bool:
+        with self._lock:
+            return not (self._counters or self._gauges or self._histograms)
+
+
 class _NoFrameworkPinning:
     """Decline every peer pin request: this rank never serves live GPU pages.
 
@@ -221,6 +267,9 @@ class _Preparation:
         "bytes_confirmed",
         "peer_hinted",
         "miss_reason",
+        "started_at",
+        "fetch_started_at",
+        "ready_observed",
     )
 
     def __init__(
@@ -231,6 +280,7 @@ class _Preparation:
         pools: dict[str, _PoolPlan],
         hint: Optional[KVCRFetchHint],
         deadline: float,
+        started_at: Optional[float] = None,
     ) -> None:
         self.handle = handle
         self.request_id = request_id
@@ -248,6 +298,9 @@ class _Preparation:
         self.bytes_confirmed = 0
         self.peer_hinted = hint is not None
         self.miss_reason: Optional[str] = None
+        self.started_at = started_at
+        self.fetch_started_at: Optional[float] = None
+        self.ready_observed = False
 
 
 class _LoadPool:
@@ -258,12 +311,14 @@ class _LoadPool:
         indices: torch.Tensor,
         claims: list[int],
         request_id: Optional[str] = None,
+        requested_at: Optional[float] = None,
     ):
         self.pool = pool
         self.page_hashes = page_hashes
         self.indices = indices
         self.claims = claims
         self.request_id = request_id
+        self.requested_at = requested_at
 
 
 class _LoadBatch:
@@ -277,6 +332,8 @@ class _LoadBatch:
         "bytes",
         "layer_outstanding",
         "error",
+        "requested_at",
+        "copy_started_at",
     )
 
     def __init__(
@@ -291,6 +348,11 @@ class _LoadBatch:
         self.bytes = 0
         self.layer_outstanding: dict[int, int] = {}
         self.error: BaseException | None = None
+        self.requested_at = min(
+            (pool.requested_at for pool in pools if pool.requested_at is not None),
+            default=None,
+        )
+        self.copy_started_at: Optional[float] = None
 
 
 class _OffloadTask:
@@ -304,9 +366,16 @@ class _OffloadTask:
         "chunks",
         "next_chunk",
         "submitted_all",
+        "started_at",
     )
 
-    def __init__(self, transfers: list[PoolTransfer], ready_event, nbytes: int):
+    def __init__(
+        self,
+        transfers: list[PoolTransfer],
+        ready_event,
+        nbytes: int,
+        started_at: Optional[float] = None,
+    ):
         self.transfers = transfers
         self.ready_event = ready_event
         self.bytes = nbytes
@@ -319,6 +388,7 @@ class _OffloadTask:
         self.chunks: Optional[list[list[tuple[str, list[str], list[int]]]]] = None
         self.next_chunk = 0
         self.submitted_all = False
+        self.started_at = started_at
 
 
 def _cpu_indices(indices: torch.Tensor) -> torch.Tensor:
@@ -444,6 +514,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         # Reentrant: owner-thread completions hold it while releasing claims,
         # and the synchronous release path takes it again to count results.
         self._lock = threading.RLock()
+        self._telemetry = _LinkerTelemetry() if self.config.enable_telemetry else None
         self._generation = 0
         self._preparations: dict[CacheRequestHandle, _Preparation] = {}
         self._by_rid: dict[str, _Preparation] = {}
@@ -633,6 +704,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         config = KVCRConfig(
             nixl_agent_name=self.agent_name,
             pool_layouts=list(self.plan.pool_layouts),
+            enable_telemetry=self.config.enable_telemetry,
             operation_timeout_ms=self.config.operation_timeout_ms,
             abandon_timeout_ms=self.config.abandon_timeout_ms,
             nixl_listen_port=_ephemeral_port(),
@@ -646,6 +718,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             key_adapter=self._key_adapter,
             inventory_sink=self._on_inventory_event,
             on_resilience_event=self._on_resilience_event,
+            stats_factory=(lambda: self._telemetry)
+            if self._telemetry is not None
+            else None,
         )
         backend_configs = KVCRBackendConfigs(
             framework_regions=self._framework_regions,
@@ -749,6 +824,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             pools=pools,
             hint=hint,
             deadline=deadline,
+            started_at=self._time(),
         )
         with self._lock:
             self._preparations[handle] = prep
@@ -796,6 +872,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return None
 
     def _mark_miss_locked(self, prep: _Preparation, reason: str) -> None:
+        if prep.state == _State.FETCHING:
+            self._record_preparation_time(prep)
         prep.state = _State.MISS
         prep.restorable = []
         prep.miss_reason = reason
@@ -807,6 +885,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         from kvcr.types import QueryStatus
 
         kvcr = self._adapter.kvcr
+        self._record_timing("prepare_queue", prep.started_at)
         if prep.hint is not None:
             try:
                 kvcr.submit_hint(prep.hint.to_kvcr_hint(), request_id=prep.request_id)
@@ -815,6 +894,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 prep.hint = None
         num_pages = len(prep.page_hashes)
         candidates: dict[str, list[bool]] = {}
+        query_started = self._time()
         for pool in prep.pools:
             keys = [self._key(page, pool) for page in prep.page_hashes]
             statuses = kvcr.query(keys, request_id=prep.request_id)
@@ -824,6 +904,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         policies = {
             pool: (plan.policy, plan.window) for pool, plan in prep.pools.items()
         }
+        self._record_timing("query", query_started)
         boundaries = restorable_boundaries(candidates, policies, num_pages)
         limit = boundaries[-1] if boundaries else 0
         # Direct restore only copies the selected trailing checkpoint/window.
@@ -880,6 +961,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 ]
                 if not entries:
                     continue
+                if prep.fetch_started_at is None:
+                    prep.fetch_started_at = self._time()
                 op = kvcr.fetch(
                     [key for _, _, key in entries],
                     request_id=prep.request_id,
@@ -958,6 +1041,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         prep.claims = {k: v for k, v in prep.claims.items() if k[1] < limit}
         self._release_handles(unusable)
         if limit > 0:
+            self._record_preparation_time(prep)
             prep.state = _State.READY
             prep.restorable = restorable
             self.stats["prepared_requests"] += 1
@@ -1011,6 +1095,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _retire_preparation_locked(self, prep: _Preparation, reason: str) -> None:
         """Drop a preparation the scheduler no longer waits for."""
         if prep.state == _State.FETCHING:
+            self._record_preparation_time(prep)
             # Outstanding ops keep draining; their claims release on arrival.
             self._inflight_prepare_bytes -= prep.bytes_requested
             self._abandoned_bytes += max(0, prep.bytes_requested - prep.bytes_confirmed)
@@ -1059,6 +1144,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             worked = True
         if now >= self._next_stats_log:
             self._next_stats_log = now + self.config.stats_log_interval_s
+            self._collect_telemetry()
             self.log_stats()
         return worked
 
@@ -1073,7 +1159,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 return True
             if self._unhealthy is not None and prep.state == _State.FETCHING:
                 self._mark_miss_locked(prep, "unhealthy")
-            return prep.state != _State.FETCHING
+            ready = prep.state != _State.FETCHING
+            if ready and not prep.ready_observed:
+                prep.ready_observed = True
+                self._record_timing("admission_wait", prep.started_at)
+            return ready
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         kv = next((t for t in transfers if t.name == PoolName.KV), None)
@@ -1136,6 +1226,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 )
             self._preparations.pop(prep.handle, None)
             pools: list[_LoadPool] = []
+            requested_at = self._time()
             for transfer in expanded:
                 pool = str(transfer.name)
                 pages = list(transfer.keys or [])
@@ -1163,6 +1254,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         transfer.host_indices,
                         claims,
                         prep.request_id if self.config.direct_remote_restore else None,
+                        requested_at,
                     )
                 )
             leftover = list(prep.claims.values())
@@ -1223,6 +1315,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _submit_load(self, batch: _LoadBatch) -> None:
         """Deliver claimed objects by logical layer through public KVCR calls."""
         kvcr = self._adapter.kvcr
+        self._record_timing("restore_wait", batch.requested_at)
+        build_started = self._time()
         try:
             per_layer = collections.defaultdict(list)
             chunk = self.config.fetch_chunk_pages
@@ -1247,6 +1341,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                                 },
                             )
                         )
+            self._record_timing("restore_build", build_started)
+            batch.copy_started_at = self._time()
             for layer in range(self.num_layers):
                 operations = per_layer.get(layer, ())
                 if not operations:
@@ -1265,6 +1361,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch.success = False
             batch.error = error
             logger.exception("KVCR load submission failed")
+        finally:
+            self._record_timing("restore_submit", batch.copy_started_at)
         # Submission failure does not cancel already accepted transfers. Keep
         # every fetch claim until their ordinary completions have drained.
         if batch.outstanding == 0:
@@ -1288,6 +1386,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _finish_load(
         self, batch: _LoadBatch, error: Optional[BaseException] = None
     ) -> None:
+        # Wall time from first submission through observed completion, including
+        # NIXL queueing/polling; this is not a CUDA kernel-only timer.
+        self._record_timing("restore_copy", batch.copy_started_at)
         for request_id in {pool.request_id for pool in batch.pools}:
             self._discard_hint(request_id)
         claims = [claim for pool in batch.pools for claim in pool.claims]
@@ -1338,7 +1439,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.stats["offload_inflight_bytes_hwm"] = max(
                 self.stats["offload_inflight_bytes_hwm"], self._inflight_offload_bytes
             )
-        task = _OffloadTask(expanded, _ready_event(), nbytes)
+        task = _OffloadTask(expanded, _ready_event(), nbytes, self._time())
         with self._lock:
             self._offload_tasks.append(task)
             self.stats["offload_tasks"] += 1
@@ -1384,8 +1485,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         deposits are deferred to the next owner-loop iteration, after it runs.
         """
         kvcr = self._adapter.kvcr
+        submitted_at = self._time()
         try:
             if task.chunks is None:
+                self._record_timing("offload_wait", task.started_at)
                 task.chunks = self._offload_chunks(task)
             while task.next_chunk < len(task.chunks):
                 deposited: list[tuple[str, str, Any]] = []
@@ -1411,6 +1514,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             logger.exception("KVCR offload submission failed")
             task.success = False
             task.submitted_all = True
+        finally:
+            # Includes descriptor construction and deposit submission on this
+            # owner pass; a yielded task can contribute more than one sample.
+            self._record_timing("offload_submit", submitted_at)
         if task.submitted_all and task.outstanding == 0:
             self._finish_offload(task)
 
@@ -1432,6 +1539,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return completion
 
     def _finish_offload(self, task: _OffloadTask) -> None:
+        self._record_timing("offload", task.started_at)
         with self._lock:
             task.done = True
             self._inflight_offload_bytes -= task.bytes
@@ -1482,6 +1590,28 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     self._mark_miss_locked(prep, "unhealthy")
         self.layer_done_counter.fail_all(error)
 
+    def _time(self) -> Optional[float]:
+        return time.monotonic() if self._telemetry is not None else None
+
+    def _record_timing(self, stage: str, started_at: Optional[float]) -> None:
+        if started_at is not None:
+            self._telemetry.observe_histogram(
+                f"{stage}_seconds", time.monotonic() - started_at
+            )
+
+    def _record_preparation_time(self, prep: _Preparation) -> None:
+        # Called once when FETCHING ends, including miss, deadline or release.
+        # Fetch time ends when preparation stops waiting; late work has its
+        # own existing completion/abandonment counters.
+        self._record_timing("prepare_latency", prep.started_at)
+        self._record_timing("fetch", prep.fetch_started_at)
+
+    def _collect_telemetry(self) -> None:
+        if self._telemetry is not None:
+            # Owner thread only: refresh core state gauges. The cumulative
+            # factory returns the same sink, so repeated reads never add totals.
+            self._adapter.kvcr.get_stats()
+
     def snapshot_stats(self) -> dict[str, float]:
         with self._lock:
             snapshot = dict(self.stats)
@@ -1495,6 +1625,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         snapshot["kvcr_pending_ops"] = self._adapter.pending_ops
         snapshot["kvcr_inflight_ops_hwm"] = self._adapter.inflight_high_water
         snapshot["dram_bytes"] = self.plan.total_bytes
+        if self._telemetry is not None:
+            snapshot.update(self._telemetry.reduce())
         return snapshot
 
     def log_stats(self) -> None:

@@ -12,6 +12,7 @@ import ctypes
 import json
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from queue import Empty, SimpleQueue
 from types import SimpleNamespace
@@ -758,7 +759,7 @@ def test_lookup_after_device_eviction_recomputes_instead_of_exposing_gaps(harnes
 
 
 def test_deadline_yields_miss_and_late_claims_are_released(harness):
-    h = harness(extra={"preparation_deadline_ms": 200})
+    h = harness(extra={"preparation_deadline_ms": 200, "enable_telemetry": True})
     hashes = _hashes("k", 2)
     h.fill(0, 2, seed=9)
     # A held deposit keeps the pages filling, so the fetch cannot confirm
@@ -771,6 +772,9 @@ def test_deadline_yields_miss_and_late_claims_are_released(harness):
     assert h.linker.lookup("r10", h.lookup_transfers(hashes)) == []
     stats = h.linker.snapshot_stats()
     assert stats["prepare_deadlines"] == 1
+    assert stats["prepare_latency_seconds_count"] == 1
+    assert stats["fetch_seconds_count"] == 1
+    assert stats["admission_wait_seconds_count"] == 1
     assert stats["abandoned_bytes"] > 0
     h.agent.default_state = "DONE"
     assert h.wait_offloads(1) == [True]
@@ -778,6 +782,10 @@ def test_deadline_yields_miss_and_late_claims_are_released(harness):
     h.wait(lambda: h.public_claims() == 0)
     assert h.linker.snapshot_stats()["late_claims_released"] == 2
     assert h.linker.snapshot_stats()["abandoned_bytes"] == 0
+    late_stats = h.linker.snapshot_stats()
+    for stage in ("prepare_latency", "fetch", "admission_wait"):
+        assert late_stats[f"{stage}_seconds_count"] == 1
+        assert late_stats[f"{stage}_seconds_sum"] == stats[f"{stage}_seconds_sum"]
 
 
 def test_failed_gpu_load_fails_the_layer_counter_and_stops_new_work(harness):
@@ -1445,6 +1453,110 @@ def test_reset_retains_core_buffers_and_claims_when_delivery_has_not_drained(har
     assert h.linker._unhealthy is None
     h.close()
     assert h.linker._closed
+
+
+def test_telemetry_summaries_are_cumulative_bounded_and_thread_safe():
+    from kvcr import DURATION_METRIC, STATE_METRIC, TRANSFER_BYTES_METRIC
+
+    stats = linker_module._LinkerTelemetry()
+    assert stats.is_empty()
+
+    def record(_):
+        stats.increase_counter(TRANSFER_BYTES_METRIC, 8, ("local_fill",))
+        stats.observe_histogram(DURATION_METRIC, 0.25, ("local_fill", "success"))
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(record, range(1000)))
+    stats.set_gauge(STATE_METRIC, 2, ("in_flight_ops",))
+    stats.set_gauge(STATE_METRIC, 0, ("in_flight_ops",))
+    snapshot = stats.reduce()
+    assert snapshot[f"{TRANSFER_BYTES_METRIC}[local_fill]"] == 8000
+    assert snapshot[f"{DURATION_METRIC}[local_fill,success]_count"] == 1000
+    assert snapshot[f"{DURATION_METRIC}[local_fill,success]_sum"] == 250
+    assert snapshot[f"{DURATION_METRIC}[local_fill,success]_max"] == 0.25
+    assert snapshot[f"{STATE_METRIC}[in_flight_ops]"] == 0
+    assert len(snapshot) == 5
+    assert not stats.is_empty()
+    assert stats.reduce() == snapshot
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("direct_remote", [False, True])
+def test_telemetry_records_real_nixl_path_and_once_only_timings(
+    harness, enabled, direct_remote
+):
+    from kvcr import DURATION_METRIC, TRANSFER_BYTES_METRIC
+
+    h = harness(
+        extra={
+            "enable_telemetry": enabled,
+            "direct_remote_restore": direct_remote,
+            "stats_log_interval_s": 3600,
+        }
+    )
+    hashes = _hashes("telemetry", 2)
+    h.fill(0, 2, seed=31)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    handle = h.prepare("telemetry", hashes)
+    h.wait_ready(handle)
+    for _ in range(3):
+        assert h.linker.preparation_ready(handle)
+    h.load("telemetry", hashes, first_page=4)
+    assert h.wait_loads(1) == [["telemetry"]]
+    h.wait(lambda: h.public_claims() == 0)
+    snapshot = h.linker.snapshot_stats()
+    if not enabled:
+        assert h.linker._telemetry is None
+        assert not any(key.startswith("kvcr_duration_seconds") for key in snapshot)
+        assert not any(key.endswith("_seconds_count") for key in snapshot)
+        return
+
+    for stage in (
+        "prepare_queue",
+        "query",
+        "prepare_latency",
+        "admission_wait",
+        "restore_wait",
+        "restore_build",
+        "restore_submit",
+        "restore_copy",
+        "offload_wait",
+        "offload_submit",
+        "offload",
+    ):
+        assert snapshot[f"{stage}_seconds_count"] == 1, stage
+        assert 0 <= snapshot[f"{stage}_seconds_max"] <= snapshot[f"{stage}_seconds_sum"]
+    if direct_remote:
+        assert not any(key.startswith("fetch_seconds_") for key in snapshot)
+    else:
+        assert snapshot["fetch_seconds_count"] == 1
+        assert 0 <= snapshot["fetch_seconds_max"] <= snapshot["fetch_seconds_sum"]
+    assert snapshot[f"{TRANSFER_BYTES_METRIC}[local_fill]"] == snapshot["offload_bytes"]
+    assert (
+        snapshot[f"{TRANSFER_BYTES_METRIC}[local_deliver]"]
+        == snapshot["gpu_restore_bytes"]
+    )
+    assert snapshot[f"{DURATION_METRIC}[local_deliver,success]_count"] == LAYERS
+    # The owner refreshes core gauges, while scheduler snapshots remain read-only.
+    refreshed = SimpleQueue()
+
+    def refresh(adapter):
+        h.linker._collect_telemetry()
+        refreshed.put(True)
+
+    h.linker._adapter.post(refresh)
+    assert refreshed.get(timeout=TIMEOUT_S)
+    first = h.linker.snapshot_stats()
+    h.linker._adapter.post(refresh)
+    assert refreshed.get(timeout=TIMEOUT_S)
+    second = h.linker.snapshot_stats()
+    assert second == first
+    assert "kvcr_state[in_flight_ops]" in second
+    assert (
+        second[f"{TRANSFER_BYTES_METRIC}[local_deliver]"]
+        == snapshot["gpu_restore_bytes"]
+    )
 
 
 if __name__ == "__main__":

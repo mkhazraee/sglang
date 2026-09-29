@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
@@ -185,7 +186,7 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
@@ -1341,6 +1342,53 @@ def test_linker_load_preserves_swa_boundaries(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("adopt_full_pages", [False, True])
+def test_mamba_checkpoint_commit_is_not_filtered_as_token_pages(
+    duplicate, adopt_full_pages
+):
+    canonical = torch.tensor([9])
+    tree = SimpleNamespace(
+        node_by_id=lambda _: SimpleNamespace(
+            component_data={ComponentType.MAMBA: SimpleNamespace(value=canonical)}
+        )
+    )
+    cache = _cache_for_wrapper(
+        page_size=64,
+        tree_core=tree,
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    full_component = FullComponent.__new__(FullComponent)
+    mamba_component = MambaComponent.__new__(MambaComponent)
+    mamba_component.tree_core = tree
+    full = PoolTransfer(
+        name=PoolName.KV, keys=["boundary"], device_indices=torch.arange(64)
+    )
+    checkpoint = PoolTransfer(
+        name=PoolName.MAMBA, keys=["boundary"], device_indices=torch.tensor([7])
+    )
+    req = SimpleNamespace(kv=SimpleNamespace(mamba_cow_src_index=None))
+    result = SimpleNamespace(
+        adopted_ranges={ComponentType.FULL: [(0, 64)] if adopt_full_pages else []},
+        last_device_node=1,
+        mamba_exist=duplicate,
+    )
+    transfers = wrapper._update_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        req,
+        [(full_component, full), (mamba_component, checkpoint)],
+        64,
+        insert_result=result,
+        canonical_full=torch.arange(64),
+    )
+    assert transfers == ([full] if adopt_full_pages else []) + (
+        [] if duplicate else [checkpoint]
+    )
+    assert req.kv.mamba_cow_src_index is canonical
+    assert checkpoint.device_indices.tolist() == [7]
 
 
 def test_preparation_readiness_is_intersected_across_ranks():

@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
     _build_deepseek_v4_device_pool_group,
+    _build_hybrid_mamba_device_pool_group,
     _dsv4_low_ratio_device_entries,
     resolve_hybrid_device_pool_group,
 )
@@ -528,18 +529,18 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_strategy_rejects_unregistered_draft_pools(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         with self.assertRaisesRegex(
             ValueError,
-            "does not support the direct external linker: _MambaStrategy",
+            "Mamba external linker does not support MTP draft pools",
         ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=SimpleNamespace(mtp_draft_device_pools=(object(),)),
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 
@@ -679,6 +680,57 @@ def test_low_ratio_indexer_rows_cover_one_logical_page():
     assert pointers == [index.index_k_with_scale_buffer[0][2].data_ptr()]
     assert sizes == [6]
     assert _dsv4_low_ratio_device_entries(SimpleNamespace(), 8) == []
+
+
+def test_mamba_entries_preserve_stage_layers_and_sibling_state():
+    full = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=None,
+        components=[[torch.zeros(8, 2)]],
+        layer_mapping={0: 0},
+        page_size=2,
+        rows_are_pages=False,
+    )
+    states = [
+        torch.zeros(8, 3),
+        torch.zeros(8, 7),
+        torch.zeros(8, 1),
+        torch.zeros(8, 2),
+    ]
+    pool = SimpleNamespace(
+        _iter_transfer_state_entries=lambda: iter(
+            [
+                ("conv", states[0], 0, 9),
+                ("temporal", states[1], 0, 9),
+                ("ple_short_conv", states[2], None, 10),
+                ("ple_ngram", states[3], None, (1 << 32) - 1),
+            ]
+        )
+    )
+    cache = SimpleNamespace(
+        full_kv_pool=None, full_attention_layer_id_mapping={8: 0}, start_layer=8
+    )
+    req = SimpleNamespace(mamba_pool=pool, translate_mamba_indices=lambda x: x)
+    with patch(
+        "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler._build_plain_kv_device_pool_group",
+        return_value=DevicePoolGroup([full], 1, 2),
+    ):
+        group = _build_hybrid_mamba_device_pool_group(cache, req, 2)
+    assert group.num_layers == 2
+    assert not group.rank_replicated
+    assert group.entries[0].layer_mapping == {0: 0}
+    assert group.entries[1].layer_mapping == {1: [0, 1, 2, 3]}
+    assert group.entries[1].get_prepared_layer_range_meta([2], 0) is None
+    pointers, _, _ = group.entries[1].get_prepared_layer_range_meta([2], 1)
+    assert pointers == [[state[2].data_ptr() for state in states]]
+
+
+def test_mamba_quantized_checkpoint_pool_is_rejected():
+    with unittest.TestCase().assertRaisesRegex(ValueError, "int8 Mamba checkpoints"):
+        _build_hybrid_mamba_device_pool_group(
+            None, SimpleNamespace(mamba_ckpt_pool=object()), 2
+        )
 
 
 if __name__ == "__main__":

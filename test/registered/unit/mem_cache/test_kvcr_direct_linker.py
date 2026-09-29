@@ -303,6 +303,8 @@ class Harness:
         with_swa: bool = False,
         extra: dict | None = None,
         network: FakePeerNetwork | None = None,
+        device_pools: tuple[DevicePoolGroup, dict] | None = None,
+        req_to_token_pool=None,
     ):
         extra = dict(extra or {})
         control_patch = nullcontext()
@@ -324,9 +326,10 @@ class Harness:
             )
         _publish_args(extra)
         self.agent = FakeNixlAgent(network)
-        self.group, self.buffers = _pool_group(with_swa=with_swa)
+        self.group, self.buffers = device_pools or _pool_group(with_swa=with_swa)
         params = SimpleNamespace(
             page_size=PAGE,
+            req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: None),
             attn_tp_cache_group=None,
             tp_cache_group=None,
@@ -619,6 +622,114 @@ def test_framework_registration_matches_page_geometry(rows_are_pages):
             region.addr + (region.count - 1) * region.stride
             == buffers[layer][last].data_ptr()
         )
+
+
+def test_mamba_restore_copies_checkpoint_and_gates_cow_until_all_spans_land(harness):
+    import threading
+    from unittest.mock import Mock
+
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    group, buffers = _pool_group(with_swa=False)
+    states = [torch.zeros(16, width, dtype=torch.uint8) for width in (3, 3, 5, 5)]
+    mamba = DevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=None,
+        components=[states],
+        layer_mapping={1: [0, 2], 2: [1, 3]},
+        page_size=1,
+        rows_are_pages=True,
+    )
+    group = DevicePoolGroup([*group.entries, mamba], LAYERS, PAGE)
+    req_pool = HybridReqToTokenPool.__new__(HybridReqToTokenPool)
+    req_pool.start_layer = 0
+    req_pool.mamba_map = {1: 0, 2: 1}
+    req_pool.mamba_pool = SimpleNamespace(copy_from=Mock())
+    h = harness(
+        device_pools=(group, buffers),
+        req_to_token_pool=req_pool,
+        extra={"operation_timeout_ms": 5000, "abandon_timeout_ms": 10000},
+    )
+    hashes = _hashes("mamba-restore", 2)
+    h.fill(0, 2, seed=41)
+    expected_kv = h.snapshot(0, 2)
+    for index, state in enumerate(states):
+        state[1].copy_(torch.arange(state.shape[1], dtype=torch.uint8) + index + 1)
+    expected_state = [state[1].clone() for state in states]
+
+    def transfers(kv_indices=None, checkpoint_indices=None):
+        return [
+            PoolTransfer(name=PoolName.KV, keys=hashes, device_indices=kv_indices),
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=hashes[-1:],
+                device_indices=checkpoint_indices,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ]
+
+    assert h.linker.offload(transfers(h.page_indices(0, 2), torch.tensor([1])))
+    assert h.wait_offloads(1) == [True]
+    handle = CacheRequestHandle(rid="mamba-restore", attempt_id=0)
+    h.linker.prepare_request(LinkerRequestContext(request=handle), transfers())
+    h.wait_ready(handle)
+    assert h.linker.lookup(handle.rid, transfers()) == [2]
+    assert h.public_claims() == 3  # Two KV pages and one boundary checkpoint.
+
+    first_restore = len(h.agent.xfers)
+    h.agent.default_state = "PROC"
+    assert h.linker.load(handle.rid, transfers(h.page_indices(8, 2), torch.tensor([6])))
+    counter = h.linker.start_layer_wise_loading()
+    h.linker.layer_done_counter.set_consumer(counter)
+    destinations = {state[6].data_ptr() for state in states}
+    h.wait(
+        lambda: destinations.issubset(
+            dst[0] for _, _, descs, _ in h.agent.xfers[first_restore:] for dst in descs
+        )
+    )
+    restore_handles = list(range(first_restore + 1, len(h.agent.xfers) + 1))
+    held = next(
+        transfer
+        for transfer in restore_handles
+        if states[0][6].data_ptr() in {dst[0] for dst in h.agent.xfers[transfer - 1][2]}
+    )
+    cow = None
+    try:
+        for transfer in restore_handles:
+            if transfer != held:
+                h.agent.states[transfer] = "DONE"
+        h.wait(lambda: all(t in h.agent.landed for t in restore_handles if t != held))
+        assert h.linker.num_completed_loads() == 0
+        assert h.public_claims() == 3
+        # Use the real COW hook: later-layer completion cannot release earlier state.
+        cow = threading.Thread(
+            target=req_pool.copy_mamba_state,
+            args=(torch.tensor([6]), torch.tensor([7])),
+            daemon=True,
+        )
+        cow.start()
+        cow.join(0.05)
+        assert cow.is_alive()
+        req_pool.mamba_pool.copy_from.assert_not_called()
+        h.agent.states[held] = "DONE"
+        assert h.wait_loads(1) == [[handle.rid]]
+        cow.join(TIMEOUT_S)
+        assert not cow.is_alive()
+        req_pool.mamba_pool.copy_from.assert_called_once()
+        h.wait(lambda: h.public_claims() == 0)
+        restored = h.snapshot(8, 2)
+        for name, layers in expected_kv.items():
+            for got, want in zip(restored[name], layers):
+                assert torch.equal(got, want)
+        for state, want in zip(states, expected_state):
+            assert torch.equal(state[6], want)
+    finally:
+        h.agent.default_state = "DONE"
+        for transfer in restore_handles:
+            h.agent.states[transfer] = "DONE"
+        if cow is not None:
+            cow.join(TIMEOUT_S)
 
 
 def test_unprepared_and_unknown_pages_never_hit(harness):

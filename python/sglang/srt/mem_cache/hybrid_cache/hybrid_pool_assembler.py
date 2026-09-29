@@ -1792,6 +1792,17 @@ class _DeepSeekV4Strategy(StackStrategy):
 
 
 class _MambaStrategy(StackStrategy):
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_hybrid_mamba_device_pool_group,
+        )
+
+        if getattr(params, "mtp_draft_device_pools", ()):
+            raise ValueError("Mamba external linker does not support MTP draft pools.")
+        return _build_hybrid_mamba_device_pool_group(
+            kvcache, params.req_to_token_pool, page_size
+        )
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 

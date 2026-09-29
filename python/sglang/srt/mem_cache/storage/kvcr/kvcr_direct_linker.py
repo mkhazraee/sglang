@@ -396,6 +396,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._pinning = _NoFrameworkPinning()
         self._control = self._build_control_channel()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        if PoolName.MAMBA in self.pools:
+            params.req_to_token_pool.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
         # Reentrant: owner-thread completions hold it while releasing claims,
         # and the synchronous release path takes it again to count results.
         self._lock = threading.RLock()

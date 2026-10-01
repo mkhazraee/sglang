@@ -1680,10 +1680,12 @@ def test_layer_delivery_releases_early_layer_and_holds_claims_until_all_drain(
         assert all(torch.equal(got, want) for got, want in zip(layers, expected[name]))
 
 
-def test_layer_waits_for_every_request_and_chunk(harness):
-    h = harness(extra={"max_inflight_restore_ops": 12})
+@pytest.mark.parametrize(("chunk", "layer_ops"), [(2, 4), (5, 2)])
+def test_layer_waits_for_every_request_and_chunk(harness, chunk, layer_ops):
+    h = harness(extra={"max_inflight_restore_ops": 12, "fetch_chunk_pages": chunk})
     hashes = _hashes("joined-layers", 4)
     h.fill(0, 4, seed=23)
+    expected = h.snapshot(0, 4)
     h.offload(hashes, first_page=0)
     assert h.wait_offloads(1) == [True]
     for rid in ("a", "b"):
@@ -1701,21 +1703,28 @@ def test_layer_waits_for_every_request_and_chunk(harness):
     first = len(h.agent.xfers) + 1
     h.agent.default_state = "PROC"
     index = h.linker.start_layer_wise_loading()
-    h.wait(lambda: len(h.agent.xfers) == first + 12 - 1)
+    h.wait(lambda: len(h.agent.xfers) == first + layer_ops * LAYERS - 1)
     futures = h.linker.layer_done_counter.futures[index]
-    # Two requests, two page chunks each: all four transfers gate layer zero.
-    for handle in range(first, first + 3):
+    # The same keys must reach both destinations, even with room in a chunk.
+    for handle in range(first, first + layer_ops - 1):
         h.agent.states[handle] = "DONE"
     h.wait(
-        lambda: all(handle in h.agent.released for handle in range(first, first + 3))
+        lambda: all(
+            handle in h.agent.released for handle in range(first, first + layer_ops - 1)
+        )
     )
     assert not futures[0].done()
-    h.agent.states[first + 3] = "DONE"
+    h.agent.states[first + layer_ops - 1] = "DONE"
     h.wait(lambda: futures[0].done())
     assert not futures[1].done() and h.public_claims() == 8
     h.agent.default_state = "DONE"
     assert h.wait_loads(1) == [["a", "b"]]
     h.wait(lambda: h.public_claims() == 0)
+    for first_page in (8, 16):
+        for name, layers in h.snapshot(first_page, 4).items():
+            assert all(
+                torch.equal(got, want) for got, want in zip(layers, expected[name])
+            )
 
 
 @pytest.mark.parametrize("limit", [1, 2])
@@ -1728,7 +1737,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
 
     owner = KVCRDirectLinker.__new__(KVCRDirectLinker)
     owner.config = SimpleNamespace(
-        fetch_chunk_pages=1,
+        fetch_chunk_pages=3,
         max_inflight_restore_ops=limit,
         progressive_restore=progressive,
     )
@@ -1741,6 +1750,9 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
     owner.stats = defaultdict(float)
     owner.layer_done_counter = linker_module.LayerWiseLoadCounter(3)
     owner._layer_spans = {"kv": {0: (0,), 1: (1,), 2: (2,)}, "swa": {0: (0,)}}
+    owner.layouts = {
+        pool: SimpleNamespace(mem_type="VRAM", device_id=0) for pool in ("kv", "swa")
+    }
     owner._rows = lambda pool, indices: indices.tolist()
     owner._key = lambda page, pool: (pool, page)
     owner._descriptors = lambda pool, row: [0, 1, 2] if pool == "kv" else [0]
@@ -1749,6 +1761,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
     owner._discard_hint = discarded.append
 
     def deliver(blocks, *, request_id):
+        assert len(blocks) <= owner.config.fetch_chunk_pages
         if failure == "submission" and len(submitted) == limit:
             raise RuntimeError("injected restore refill failure")
         submitted.append((blocks, request_id))
@@ -1795,7 +1808,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
         if failure is None:
             if not progressive and pending:
                 assert not any(future.done() for future in futures)
-            for layer, total in enumerate((6, 4, 4)):
+            for layer, total in enumerate((2, 2, 2)):
                 if completed_layers[layer] < total:
                     assert not futures[layer].done()
                 elif progressive:
@@ -1808,8 +1821,10 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
     assert owner._active_load_batches == 0
     if failure is None:
         assert [next(iter(blocks.values()))[0] for blocks, _ in submitted] == (
-            [0] * 6 + [1] * 4 + [2] * 4
+            [0, 0, 1, 1, 2, 2]
         )
+        assert [rid for _, rid in submitted] == ["a", "b"] * 3
+        assert set(submitted[0][0]) == {("kv", "a"), ("kv", "b"), ("swa", "b")}
         assert all(f.done() and f.exception() is None for f in futures)
     else:
         assert owner._unhealthy is not None

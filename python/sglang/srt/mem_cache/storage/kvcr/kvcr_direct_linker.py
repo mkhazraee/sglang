@@ -1358,8 +1358,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         build_started = self._time()
         try:
             per_layer = collections.defaultdict(list)
+            last_chunks = {}
             chunk = self.config.fetch_chunk_pages
             for pool in batch.pools:
+                layout = self.layouts[pool.pool]
                 rows = self._rows(pool.pool, pool.indices)
                 if len(rows) != len(pool.page_hashes):
                     raise RuntimeError(
@@ -1370,16 +1372,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     for page, row in zip(pool.page_hashes, rows)
                 ]
                 for layer, indices in self._layer_spans[pool.pool].items():
-                    for start in range(0, len(pages), chunk):
-                        per_layer[layer].append(
-                            (
-                                pool.request_id,
-                                {
-                                    key: [descriptors[index] for index in indices]
-                                    for key, descriptors in pages[start : start + chunk]
-                                },
-                            )
-                        )
+                    group = (layer, pool.request_id, layout.mem_type, layout.device_id)
+                    blocks = last_chunks.get(group)
+                    for key, descriptors in pages:
+                        # Share chunks across compatible pools, but preserve
+                        # repeated keys targeting different destination rows.
+                        if blocks is None or len(blocks) == chunk or key in blocks:
+                            blocks = last_chunks[group] = {}
+                            per_layer[layer].append((pool.request_id, blocks))
+                        blocks[key] = [descriptors[index] for index in indices]
             self._record_timing("restore_build", build_started)
             batch.copy_started_at = self._time()
             for layer in range(self.num_layers):

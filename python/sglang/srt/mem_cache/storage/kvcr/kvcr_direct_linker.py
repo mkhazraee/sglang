@@ -326,6 +326,7 @@ class _LoadBatch:
         "rids",
         "pools",
         "ready_event",
+        "operations",
         "outstanding",
         "success",
         "bytes",
@@ -342,6 +343,7 @@ class _LoadBatch:
         self.rids = rids
         self.pools = pools
         self.ready_event = ready_event
+        self.operations = collections.deque()
         self.outstanding = 0
         self.success = True
         self.bytes = 0
@@ -518,6 +520,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._preparations: dict[CacheRequestHandle, _Preparation] = {}
         self._by_rid: dict[str, _Preparation] = {}
         self._pending_loads: dict[str, list[_LoadPool]] = {}
+        self._active_load_batches = 0
         self._completed_loads: collections.deque[list[str]] = collections.deque()
         self._offload_tasks: collections.deque[_OffloadTask] = collections.deque()
         self._offload_results: collections.deque[bool] = collections.deque()
@@ -1323,6 +1326,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         with self._lock:
             self.stats["load_batches"] += 1
+            self._active_load_batches += 1
         self._adapter.post(
             lambda adapter: self._defer(
                 batch.ready_event, lambda: self._submit_load(batch)
@@ -1338,7 +1342,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def _submit_load(self, batch: _LoadBatch) -> None:
         """Deliver claimed objects by logical layer through public KVCR calls."""
-        kvcr = self._adapter.kvcr
         self._record_timing("restore_wait", batch.requested_at)
         build_started = self._time()
         try:
@@ -1377,19 +1380,38 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     continue
                 batch.layer_outstanding[layer] = len(operations)
                 for request_id, blocks in operations:
-                    op = kvcr.deliver(blocks, request_id=request_id)
-                    batch.outstanding += 1
-                    self._adapter.track(
-                        op, self._load_completion(batch, layer, tuple(blocks))
-                    )
+                    batch.operations.append((layer, request_id, blocks))
         except Exception as error:
             batch.success = False
             batch.error = error
             logger.exception("KVCR load submission failed")
-        finally:
-            self._record_timing("restore_submit", batch.copy_started_at)
-        # Submission failure does not cancel already accepted transfers. Keep
-        # every fetch claim until their ordinary completions have drained.
+        self._refill_load(batch)
+
+    def _refill_load(self, batch: _LoadBatch) -> None:
+        """Submit the next layer-ordered operations as window slots become free."""
+        if batch.success and batch.operations:
+            submit_started = self._time()
+            try:
+                while (
+                    batch.operations
+                    and batch.outstanding < self.config.max_inflight_restore_ops
+                ):
+                    layer, request_id, blocks = batch.operations.popleft()
+                    op = self._adapter.kvcr.deliver(blocks, request_id=request_id)
+                    batch.outstanding += 1
+                    self._adapter.track(
+                        op, self._load_completion(batch, layer, tuple(blocks))
+                    )
+            except Exception as error:
+                batch.success = False
+                batch.error = error
+                logger.exception("KVCR load submission failed")
+            finally:
+                self._record_timing("restore_submit", submit_started)
+        if not batch.success:
+            batch.operations.clear()
+        # Failure does not cancel accepted transfers. Hold claims and hints
+        # until their ordinary completions drain; do not submit queued work.
         if batch.outstanding == 0:
             self._finish_load(batch, error=batch.error)
 
@@ -1409,8 +1431,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 )
                 if self.config.progressive_restore:
                     self.layer_done_counter.complete(batch.counter_index, layer)
-            if batch.outstanding == 0:
-                self._finish_load(batch, error=batch.error)
+            self._refill_load(batch)
 
         return completion
 
@@ -1445,6 +1466,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._release_handles(claims)
         with self._lock:
             self._completed_loads.append(batch.rids)
+            self._active_load_batches -= 1
 
     # ------------------------------------------------------------------
     # Offload: GPU pages -> KVCR DRAM through deposit
@@ -1686,7 +1708,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     # ------------------------------------------------------------------
 
     def _drain(self, timeout_s: float) -> bool:
-        """Wait for tracked KVCR operations; False if some are still pending."""
+        """Wait for tracked operations and queued restore work to drain."""
         deadline = time.monotonic() + timeout_s
         # Previously queued work may not have submitted a KVCR operation yet.
         submitted = threading.Event()
@@ -1699,10 +1721,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         while time.monotonic() < deadline:
             if not self._adapter.healthy:
                 return False
-            if self._adapter.pending_ops == 0 and not self._deferred:
-                return True
+            with self._lock:
+                if (
+                    self._active_load_batches == 0
+                    and self._adapter.pending_ops == 0
+                    and not self._deferred
+                ):
+                    return True
             time.sleep(_DRAIN_POLL_S)
-        return self._adapter.pending_ops == 0 and not self._deferred
+        with self._lock:
+            return (
+                self._active_load_batches == 0
+                and self._adapter.pending_ops == 0
+                and not self._deferred
+            )
 
     def _release_everything(self) -> None:
         with self._lock:

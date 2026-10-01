@@ -1168,6 +1168,18 @@ def test_hint_parser_reads_kv_fetch_and_ignores_unknown_actions():
 
 def test_config_rejects_unknown_and_unsafe_options():
     assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).eviction_policy == "lru"
+    assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).max_inflight_restore_ops == 8
+    assert (
+        KVCRLinkerConfig.from_extra_config(
+            {"local_dram_bytes_per_worker": 1, "max_inflight_restore_ops": 2}
+        ).max_inflight_restore_ops
+        == 2
+    )
+    for limit in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="max_inflight_restore_ops"):
+            KVCRLinkerConfig.from_extra_config(
+                {"local_dram_bytes_per_worker": 1, "max_inflight_restore_ops": limit}
+            )
     with pytest.raises(ValueError, match="eviction_policy"):
         KVCRLinkerConfig.from_extra_config(
             {"local_dram_bytes_per_worker": 1, "eviction_policy": "random"}
@@ -1394,7 +1406,7 @@ def test_multi_pool_fetches_keep_each_expected_layout_homogeneous(harness):
 def test_drain_waits_for_queued_load_submission(harness):
     import threading
 
-    h = harness()
+    h = harness(extra={"max_inflight_restore_ops": 1})
     hashes = _hashes("queued-drain", 2)
     h.fill(0, 2, seed=26)
     h.offload(hashes, first_page=0)
@@ -1418,7 +1430,7 @@ def test_drain_waits_for_queued_load_submission(harness):
         drain.join(0.05)
         assert drain.is_alive()
         unblock.set()
-        h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
+        h.wait(lambda: len(h.agent.xfers) == first)
         assert h.public_claims() == 2 and drain.is_alive()
         h.agent.default_state = "DONE"
         drain.join(TIMEOUT_S)
@@ -1430,8 +1442,29 @@ def test_drain_waits_for_queued_load_submission(harness):
         drain.join(TIMEOUT_S)
 
 
+def test_drain_waits_for_active_restore_between_completions_and_refill():
+    import threading
+
+    owner = KVCRDirectLinker.__new__(KVCRDirectLinker)
+    owner._lock = threading.RLock()
+    owner._adapter = SimpleNamespace(
+        healthy=True, pending_ops=0, post=lambda command: command(None)
+    )
+    owner._deferred = []
+    owner._active_load_batches = 1
+    assert not owner._drain(0.01)
+    owner._active_load_batches = 0
+    assert owner._drain(0.01)
+
+
 def test_reset_retains_core_buffers_and_claims_when_delivery_has_not_drained(harness):
-    h = harness(extra={"operation_timeout_ms": 5000, "abandon_timeout_ms": 10000})
+    h = harness(
+        extra={
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+            "max_inflight_restore_ops": 1,
+        }
+    )
     hashes = _hashes("reset-drain", 2)
     h.fill(0, 2, seed=28)
     h.offload(hashes, first_page=0)
@@ -1440,7 +1473,7 @@ def test_reset_retains_core_buffers_and_claims_when_delivery_has_not_drained(har
     h.agent.default_state = "PROC"
     first = len(h.agent.xfers) + 1
     h.load("reset-drain", hashes, first_page=4)
-    h.wait(lambda: len(h.agent.xfers) == first + LAYERS - 1)
+    h.wait(lambda: len(h.agent.xfers) == first)
     core, buffer, adapter = h.linker._kvcr, h.linker._local_dram, h.linker._adapter
     drain = h.linker._drain
     with patch.object(h.linker, "_drain", side_effect=lambda timeout: drain(0.02)):
@@ -1587,7 +1620,7 @@ def test_layer_delivery_releases_early_layer_and_holds_claims_until_all_drain(
 
 
 def test_layer_waits_for_every_request_and_chunk(harness):
-    h = harness()
+    h = harness(extra={"max_inflight_restore_ops": 12})
     hashes = _hashes("joined-layers", 4)
     h.fill(0, 4, seed=23)
     h.offload(hashes, first_page=0)
@@ -1622,6 +1655,106 @@ def test_layer_waits_for_every_request_and_chunk(harness):
     h.agent.default_state = "DONE"
     assert h.wait_loads(1) == [["a", "b"]]
     h.wait(lambda: h.public_claims() == 0)
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+@pytest.mark.parametrize("progressive", [False, True])
+@pytest.mark.parametrize("failure", [None, "submission", "entry"])
+def test_restore_window_bounds_work_and_drains_failures(limit, progressive, failure):
+    """Refills must bound all pools and keep claims/hints until accepted work drains."""
+    import threading
+    from collections import defaultdict, deque
+
+    owner = KVCRDirectLinker.__new__(KVCRDirectLinker)
+    owner.config = SimpleNamespace(
+        fetch_chunk_pages=1,
+        max_inflight_restore_ops=limit,
+        progressive_restore=progressive,
+    )
+    owner.num_layers = 3
+    owner._lock = threading.RLock()
+    owner._telemetry = None
+    owner._unhealthy = None
+    owner._active_load_batches = 1
+    owner._completed_loads = deque()
+    owner.stats = defaultdict(float)
+    owner.layer_done_counter = linker_module.LayerWiseLoadCounter(3)
+    owner._layer_spans = {"kv": {0: (0,), 1: (1,), 2: (2,)}, "swa": {0: (0,)}}
+    owner._rows = lambda pool, indices: indices.tolist()
+    owner._key = lambda page, pool: (pool, page)
+    owner._descriptors = lambda pool, row: [0, 1, 2] if pool == "kv" else [0]
+    released, discarded, submitted, pending = [], [], [], {}
+    owner._release_handles = released.extend
+    owner._discard_hint = discarded.append
+
+    def deliver(blocks, *, request_id):
+        if failure == "submission" and len(submitted) == limit:
+            raise RuntimeError("injected restore refill failure")
+        submitted.append((blocks, request_id))
+        return len(submitted)
+
+    def track(op, done):
+        pending[op] = done
+
+    owner._adapter = SimpleNamespace(kvcr=SimpleNamespace(deliver=deliver), track=track)
+    pools = [
+        linker_module._LoadPool(
+            pool,
+            ["a", "b"] if pool == "kv" else ["b"],
+            torch.tensor([0, 1] if pool == "kv" else [1]),
+            [claim * 2, claim * 2 + 1] if pool == "kv" else [claim * 2],
+            request_id=rid,
+        )
+        for claim, (rid, pool) in enumerate(
+            [("a", "kv"), ("a", "swa"), ("b", "kv"), ("b", "swa")]
+        )
+    ]
+    index = owner.layer_done_counter.update_producer()
+    batch = linker_module._LoadBatch(index, ["a", "b"], pools, None)
+    owner._submit_load(batch)
+    futures = owner.layer_done_counter.futures[index]
+    assert len(pending) == len(submitted) == limit
+    assert not any(future.done() for future in futures)
+    completed_layers = defaultdict(int)
+    failed = False
+    while pending:
+        # Keep the oldest accepted operation alive while newer ones finish.
+        op = max(pending)
+        done = pending.pop(op)
+        blocks, _ = submitted[op - 1]
+        success = not (failure == "entry" and op == limit + 1)
+        failed |= not success
+        layer = next(iter(blocks.values()))[0]
+        completed_layers[layer] += int(success)
+        done({key: SimpleNamespace(success=success) for key in blocks})
+        assert len(pending) <= limit
+        if pending:
+            assert released == discarded == []
+            assert owner.num_completed_loads() == 0
+        if failure is None:
+            if not progressive and pending:
+                assert not any(future.done() for future in futures)
+            for layer, total in enumerate((6, 4, 4)):
+                if completed_layers[layer] < total:
+                    assert not futures[layer].done()
+                elif progressive:
+                    assert futures[layer].done()
+        elif failure == "submission" or failed:
+            assert len(submitted) == limit + int(failure == "entry")
+    assert sorted(released) == [0, 1, 2, 4, 5, 6]
+    assert sorted(discarded) == ["a", "b"]
+    assert owner.pop_completed_load() == ["a", "b"]
+    assert owner._active_load_batches == 0
+    if failure is None:
+        assert [next(iter(blocks.values()))[0] for blocks, _ in submitted] == (
+            [0] * 6 + [1] * 4 + [2] * 4
+        )
+        assert all(f.done() and f.exception() is None for f in futures)
+    else:
+        assert owner._unhealthy is not None
+        owner.layer_done_counter.set_consumer(index)
+        with pytest.raises(RuntimeError, match="layer-wise KV load failed"):
+            owner.layer_done_counter.wait_until(2)
 
 
 def test_wait_for_later_layer_also_waits_for_incomplete_earlier_layers(harness):
@@ -2129,6 +2262,7 @@ def test_layer_telemetry_waits_for_all_chunks_independently_of_release_mode(
             "enable_telemetry": True,
             "direct_remote_restore": direct_remote,
             "progressive_restore": progressive,
+            "max_inflight_restore_ops": 2,
         }
     )
     hashes = _hashes("timed-layer-chunks", 4)
@@ -2151,7 +2285,7 @@ def test_layer_telemetry_waits_for_all_chunks_independently_of_release_mode(
     h.agent.default_state = "PROC"
     try:
         index = h.linker.start_layer_wise_loading()
-        h.wait(lambda: len(h.agent.xfers) == first + 12 - 1)
+        h.wait(lambda: len(h.agent.xfers) == first + 1)
         futures = h.linker.layer_done_counter.futures[index]
         metric = "restore_layer_completion_seconds[0]_count"
         # Two requests and two chunks per request contribute to layer zero.

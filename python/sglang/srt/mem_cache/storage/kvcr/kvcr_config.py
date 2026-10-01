@@ -54,6 +54,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_prepare_bytes: int = 8 << 30
     max_prepare_bytes_per_request: int = 2 << 30
     fetch_chunk_pages: int = 32
+    # Per restore batch, shared across requests, pools, and page chunks.
+    max_inflight_restore_ops: int = 8
     # Bound the amount of work submitted by a single offload operation.
     offload_chunk_pages: int = 8
     # Offloads beyond this many in-flight bytes are declined; the tree retries.
@@ -91,6 +93,7 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
             "max_inflight_prepare_requests",
             "max_inflight_prepare_bytes",
             "max_prepare_bytes_per_request",
+            "max_inflight_restore_ops",
             "max_inflight_offload_bytes",
             "max_abandoned_bytes",
         ):

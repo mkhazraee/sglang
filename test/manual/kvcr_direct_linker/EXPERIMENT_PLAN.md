@@ -83,8 +83,10 @@ not substitutes for these checks.
 
 The first six checkpoints are: local whole-object backend, peer staging,
 DeepSeek C1/C2 support, Mamba checkpoint correctness, progressive named spans,
-and sparse checkpoint capacity. The last three add direct restoration,
-telemetry/diagnostics, and policy selection.
+and sparse checkpoint capacity. The next three add direct restoration,
+telemetry/diagnostics, and policy selection. Checkpoint 10 aligns successfully
+offloaded ALL_PAGES sequences for tail-first LRU eviction; trailing windows and
+single checkpoints are excluded.
 
 Use external client timing and the same profiler tooling for comparisons before
 telemetry exists. Detailed linker timings are available from checkpoint 8;
@@ -118,6 +120,10 @@ only `eviction_policy` between `lru` and `fifo`; report misses, evictions,
 transferred bytes, TTFT and throughput. Include a non-pressure control where both
 policies should have the same hits. Keep these results separate from the
 progressive-delivery and sparse-capacity comparisons.
+
+Compare checkpoints 9 and 10 with LRU and the same pressure trace to isolate
+sequence alignment. Measure retained prefix lengths as well as hit rate. Alignment
+covers each offloaded segment; later accesses can change its recency again.
 
 Publish the exact setup, per-run results and failed cases. A result applies only
 to the tested model, workload and hardware until further measurements establish

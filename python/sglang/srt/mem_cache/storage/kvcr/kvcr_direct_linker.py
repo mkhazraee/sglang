@@ -1570,6 +1570,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def _finish_offload(self, task: _OffloadTask) -> None:
         self._record_timing("offload", task.started_at)
+        if task.success:
+            for transfer in task.transfers:
+                pages = transfer.keys or ()
+                if transfer.hit_policy == PoolHitPolicy.ALL_PAGES and len(pages) > 1:
+                    # Keep the beginning of a dense prefix when LRU needs space.
+                    self._adapter.kvcr.align_sequence(
+                        [self._key(page, str(transfer.name)) for page in pages]
+                    )
         with self._lock:
             task.done = True
             self._inflight_offload_bytes -= task.bytes

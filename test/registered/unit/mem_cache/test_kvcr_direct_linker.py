@@ -1028,11 +1028,16 @@ def test_reset_clears_local_residency(harness):
     assert h.linker.lookup("r14", h.lookup_transfers(hashes)) == [1, 2]
 
 
-def test_inventory_removal_reports_page_event_hashes(harness):
-    # A tiny tier: the third page evicts the first, and the eviction surfaces
-    # as an EXTERNAL removal keyed by the page's event hash.
+@pytest.mark.parametrize(("policy", "evicted_index"), [("fifo", 0), ("lru", 1)])
+def test_inventory_removal_reports_page_event_hashes(harness, policy, evicted_index):
+    # Across deposit chunks, aligned LRU retains the beginning of the prefix;
+    # FIFO still evicts its first page. Both report the page's event hash.
     h = harness(
-        extra={"local_dram_bytes_per_worker": ROW_BYTES * PAGE * (2 * LAYERS) * 2}
+        extra={
+            "local_dram_bytes_per_worker": ROW_BYTES * PAGE * (2 * LAYERS) * 2,
+            "offload_chunk_pages": 1,
+            "eviction_policy": policy,
+        }
     )
     hashes = _hashes("n", 3)
     h.fill(0, 3, seed=12)
@@ -1042,8 +1047,32 @@ def test_inventory_removal_reports_page_event_hashes(harness):
     assert h.wait_offloads(1) == [True]
     h.wait(lambda: h.linker.snapshot_stats()["inventory_removed_pages"] >= 1)
     removed = h.linker.take_removed_page_hashes()
-    assert hash_str_to_int64(hashes[0]) in removed
+    assert removed == [hash_str_to_int64(hashes[evicted_index])]
     assert h.linker.take_removed_page_hashes() == []
+
+
+@pytest.mark.parametrize(
+    ("pages", "swa_tail", "success"),
+    [(1, 0, True), (2, 2, True), (2, 0, False)],
+    ids=["single", "trailing", "failed"],
+)
+def test_offload_alignment_skips_ineligible_sequences(
+    harness, pages, swa_tail, success
+):
+    h = harness(with_swa=bool(swa_tail))
+    hashes = _hashes("skip-align", pages)
+    h.agent.default_state = "DONE" if success else "ERR"
+    with patch.object(
+        h.linker._kvcr, "align_sequence", wraps=h.linker._kvcr.align_sequence
+    ) as align:
+        h.offload(hashes, first_page=0, swa_tail=swa_tail)
+        assert h.wait_offloads(1) == [success]
+        if swa_tail:
+            align.assert_called_once_with(
+                [h.linker._key(page, "kv") for page in hashes]
+            )
+        else:
+            align.assert_not_called()
 
 
 def test_offload_backpressure_declines_beyond_inflight_bytes(harness):

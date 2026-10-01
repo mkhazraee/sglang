@@ -48,6 +48,8 @@ class PoolObjectLayout(msgspec.Struct, frozen=True, kw_only=True):
     labels: tuple[str, ...]
     # (base_ptr, row_stride_bytes, span_bytes) per span.
     spans: tuple[tuple[int, int, int], ...]
+    # (storage dtype, per-page shape, element strides), without pool capacity.
+    span_layouts: tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...]
 
     @property
     def span_sizes(self) -> tuple[int, ...]:
@@ -125,6 +127,14 @@ def _layout_for_entry(entry: DevicePoolEntry) -> PoolObjectLayout:
         device_id=nixl_device_id(device),
         labels=tuple(labels),
         spans=tuple(spans),
+        span_layouts=tuple(
+            (
+                str(buffer.dtype),
+                (entry._row_span, *buffer.shape[1:]),
+                tuple(buffer.stride()),
+            )
+            for buffer in entry.kv_buffer
+        ),
     )
 
 
@@ -269,6 +279,7 @@ def compatibility_identity(
                 "mem_type": layout.mem_type,
                 "labels": list(layout.labels),
                 "span_sizes": list(layout.span_sizes),
+                "span_layouts": layout.span_layouts,
             }
             for name, layout in layouts.items()
         },

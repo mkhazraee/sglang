@@ -1680,7 +1680,7 @@ def test_fetch_completion_rechecks_retirement_after_acquiring_lock():
         state=linker_module._State.FETCHING,
         claims={},
         pools={"kv": SimpleNamespace(present=[False])},
-        bytes_confirmed=0,
+        bytes_pending=8,
         outstanding_ops=2,
     )
     released = []
@@ -1704,6 +1704,91 @@ def test_fetch_completion_rechecks_retirement_after_acquiring_lock():
     assert prep.claims == {}
     assert released == [17]
     assert owner._abandoned_bytes == 0
+
+
+@pytest.mark.parametrize("retirement", ["release", "deadline"])
+@pytest.mark.parametrize(
+    ("sparse", "first_success", "remaining_bytes"),
+    [(False, False, 8), (True, True, 16)],
+)
+def test_abandoned_bytes_count_only_pending_fetches(
+    retirement, sparse, first_success, remaining_bytes
+):
+    """Failed fetches and absent checkpoints must not leave permanent backpressure."""
+    import threading
+    from collections import defaultdict
+
+    from kvcr.types import QueryStatus
+
+    owner = KVCRDirectLinker.__new__(KVCRDirectLinker)
+    owner.config = KVCRLinkerConfig(
+        local_dram_bytes_per_worker=64,
+        fetch_chunk_pages=1,
+        max_abandoned_bytes=8,
+    )
+    owner._lock = threading.RLock()
+    owner._telemetry = None
+    owner._unhealthy = None
+    owner._closed = False
+    owner._inflight_prepare_bytes = owner._abandoned_bytes = 0
+    owner._deferred = []
+    owner._next_stats_log = float("inf")
+    owner.stats = defaultdict(float)
+    pools = {"kv": linker_module._PoolPlan("kv", "all_pages", 0, [False, False])}
+    if sparse:
+        pools["mamba"] = linker_module._PoolPlan(
+            "mamba", "trailing_pages", 1, [False, False]
+        )
+    owner.layouts = {
+        pool: SimpleNamespace(object_bytes=8, expected_layout=[pool]) for pool in pools
+    }
+    owner._object_bytes = 8 * len(pools)
+    owner._key = lambda page, pool: (pool, page)
+    owner._control = None
+    released = []
+    owner._release_handles = released.extend
+    prep = linker_module._Preparation(
+        CacheRequestHandle(rid="retired", attempt_id=0),
+        "retired#0",
+        ["a", "b"],
+        pools,
+        None,
+        deadline=1.0,
+    )
+    owner._preparations = {prep.handle: prep}
+    owner._by_rid = {prep.handle.rid: prep}
+    submitted, completions = [], []
+
+    def query(keys, **kwargs):
+        return [
+            (QueryStatus.MISS if key == ("mamba", "a") else QueryStatus.HIT, None)
+            for key in keys
+        ]
+
+    def fetch(keys, **kwargs):
+        submitted.append(keys)
+        return len(submitted) - 1
+
+    owner._adapter = SimpleNamespace(
+        kvcr=SimpleNamespace(query=query, fetch=fetch),
+        track=lambda op, done: completions.append((submitted[op], done)),
+    )
+    owner._start_preparation(prep)
+    keys, done = completions.pop(0)
+    done(
+        {key: SimpleNamespace(success=first_success, release_handle=1) for key in keys}
+    )
+    if retirement == "release":
+        owner.release_request(prep.handle.rid)
+    else:
+        owner._tick(prep.deadline)
+    assert owner._abandoned_bytes == remaining_bytes
+    assert owner._inflight_prepare_bytes == 0
+    for keys, done in completions:
+        done({key: SimpleNamespace(success=True, release_handle=2) for key in keys})
+    assert owner._abandoned_bytes == 0
+    assert owner._decline_reason_locked() is None
+    assert len(released) == int(first_success) + len(completions)
 
 
 @pytest.mark.parametrize("retirement_point", ["queued", "query"])

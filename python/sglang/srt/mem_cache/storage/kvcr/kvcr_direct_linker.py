@@ -263,7 +263,7 @@ class _Preparation:
         "claims",
         "restorable",
         "bytes_requested",
-        "bytes_confirmed",
+        "bytes_pending",
         "peer_hinted",
         "miss_reason",
         "started_at",
@@ -294,7 +294,7 @@ class _Preparation:
         self.claims: dict[tuple[str, int], int] = {}
         self.restorable: list[int] = []
         self.bytes_requested = 0
-        self.bytes_confirmed = 0
+        self.bytes_pending = 0
         self.peer_hinted = hint is not None
         self.miss_reason: Optional[str] = None
         self.started_at = started_at
@@ -984,15 +984,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 ]
                 if not entries:
                     continue
-                if prep.fetch_started_at is None:
-                    prep.fetch_started_at = self._time()
-                op = kvcr.fetch(
-                    [key for _, _, key in entries],
-                    request_id=prep.request_id,
-                    expected_layout=layout,
-                )
-                prep.outstanding_ops += 1
-                self._adapter.track(op, self._fetch_completion(prep, entries))
+                with self._lock:
+                    # Retirement must see every accepted fetch and its bytes.
+                    if prep.state != _State.FETCHING:
+                        return
+                    if prep.fetch_started_at is None:
+                        prep.fetch_started_at = self._time()
+                    op = kvcr.fetch(
+                        [key for _, _, key in entries],
+                        request_id=prep.request_id,
+                        expected_layout=layout,
+                    )
+                    prep.outstanding_ops += 1
+                    prep.bytes_pending += len(entries) * self.layouts[pool].object_bytes
+                    self._adapter.track(op, self._fetch_completion(prep, entries))
         if prep.outstanding_ops == 0:
             with self._lock:
                 self._finish_preparation_locked(prep, reason="no_candidates")
@@ -1004,7 +1009,6 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """Completion for one fetch operation over ``(pool, page, key)`` entries."""
 
         def completion(entries: Mapping[Any, Any]) -> None:
-            confirmed_bytes = 0
             requested_bytes = 0
             with self._lock:
                 late = prep.state != _State.FETCHING
@@ -1021,14 +1025,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         continue
                     prep.claims[(pool, page)] = entry.release_handle
                     prep.pools[pool].present[page] = True
-                    confirmed_bytes += object_bytes
+                prep.bytes_pending -= requested_bytes
                 if late:
                     self._abandoned_bytes = max(
                         0, self._abandoned_bytes - requested_bytes
                     )
                     self.stats["late_completions"] += 1
                     return
-                prep.bytes_confirmed += confirmed_bytes
                 prep.outstanding_ops -= 1
                 if prep.outstanding_ops == 0:
                     self._finish_preparation_locked(prep, reason=None)
@@ -1121,7 +1124,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._record_preparation_time(prep)
             # Outstanding ops keep draining; their claims release on arrival.
             self._inflight_prepare_bytes -= prep.bytes_requested
-            self._abandoned_bytes += max(0, prep.bytes_requested - prep.bytes_confirmed)
+            self._abandoned_bytes += prep.bytes_pending
             self.stats["abandoned_bytes_hwm"] = max(
                 self.stats["abandoned_bytes_hwm"], self._abandoned_bytes
             )
@@ -1146,9 +1149,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 if prep.state == _State.MISS:
                     prep.miss_reason = "deadline"
                 self.stats["prepare_deadlines"] += 1
-                self._abandoned_bytes += max(
-                    0, prep.bytes_requested - prep.bytes_confirmed
-                )
+                self._abandoned_bytes += prep.bytes_pending
                 self.stats["abandoned_bytes_hwm"] = max(
                     self.stats["abandoned_bytes_hwm"], self._abandoned_bytes
                 )

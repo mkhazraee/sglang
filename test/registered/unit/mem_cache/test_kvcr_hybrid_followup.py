@@ -6,7 +6,17 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import plan_capacity
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
+from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import (
+    build_pool_object_layouts,
+    compatibility_digest_for,
+    compatibility_identity,
+    plan_capacity,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
@@ -16,6 +26,47 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_pool_digest_tracks_page_layout_and_storage_dtype():
+    """Equal-size pages with different token/head order must not share keys."""
+
+    def digest(buffer, *, rows_are_pages=False):
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[buffer]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=rows_are_pages,
+        )
+        layouts = build_pool_object_layouts(DevicePoolGroup([entry], 1, 2))
+        return compatibility_digest_for(
+            compatibility_identity(
+                model_path="same-model",
+                revision=None,
+                dtype="auto",
+                kv_cache_dtype="auto",
+                quantization=None,
+                page_size=2,
+                is_eagle=False,
+                layouts=layouts,
+                shard={"tp_rank": 0, "tp_size": 1},
+                speculative={},
+            )
+        )
+
+    nhd = torch.empty((8, 2, 2), dtype=torch.bfloat16)
+    expected = digest(nhd)
+    # Addresses and capacity do not change the bytes within a logical page.
+    assert expected == digest(torch.empty((12, 2, 2), dtype=torch.bfloat16))
+    # Equal byte counts do not imply equal token/head order or storage dtype.
+    assert expected != digest(
+        torch.empty((4, 2, 2, 2), dtype=torch.bfloat16), rows_are_pages=True
+    )
+    assert expected != digest(torch.empty_like(nhd, dtype=torch.float16))
+    assert expected != digest(nhd.transpose(1, 2))
 
 
 def test_sparse_checkpoint_capacity_uses_physical_object_counts():

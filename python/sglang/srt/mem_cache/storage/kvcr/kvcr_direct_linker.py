@@ -25,6 +25,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
+from functools import lru_cache
 from typing import Any, Optional
 
 import msgspec
@@ -502,6 +503,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         self._kvcr_factory = _kvcr_factory
         self.agent_name = self._new_agent_name()
+        self._descriptor_cache = lru_cache(
+            maxsize=self.config.max_cached_descriptor_pages
+        )(self._build_descriptors)
         self._framework_regions = self._build_framework_regions()
         self._key_adapter = KVCRLinkerKeyAdapter()
         self._pinning = _NoFrameworkPinning()
@@ -800,9 +804,17 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return encode_object_key(page_hash, self.digest, pool)
 
     def _descriptors(self, pool: str, row: int) -> list:
+        # Pool addresses/layouts stay fixed until teardown. Cache by physical
+        # row, independent of the request or tokens currently occupying it.
+        # Give each operation its own list around the immutable descriptors.
+        return list(self._descriptor_cache(pool, row))
+
+    def _build_descriptors(self, pool: str, row: int) -> tuple:
         from kvcr.types import MemDescriptor
 
-        return page_descriptors(self.layouts[pool], row, self.agent_name, MemDescriptor)
+        return tuple(
+            page_descriptors(self.layouts[pool], row, self.agent_name, MemDescriptor)
+        )
 
     def _rows(self, pool: str, indices: torch.Tensor) -> list[int]:
         # Called after the producer event completes. The ordinary synchronous
@@ -1774,6 +1786,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if not self._adapter.stop(timeout_s=5.0):
                 raise RuntimeError("KVCR owner thread did not stop")
             self._kvcr.close()
+            # reset() assigns a new agent name; old endpoints must not survive.
+            self._descriptor_cache.cache_clear()
         except BaseException as error:
             # A fresh DRAM allocation cannot isolate old writes into GPU pools.
             # Keep the old core and every buffer attached and fail closed.

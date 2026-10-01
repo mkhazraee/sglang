@@ -56,6 +56,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     fetch_chunk_pages: int = 32
     # Per restore batch, shared across requests, pools, and page chunks.
     max_inflight_restore_ops: int = 8
+    # Physical-page descriptor lists retained across transfers; 0 disables reuse.
+    max_cached_descriptor_pages: int = 4096
     # Bound the amount of work submitted by a single offload operation.
     offload_chunk_pages: int = 8
     # Offloads beyond this many in-flight bytes are declined; the tree retries.
@@ -89,6 +91,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("KVCR fetch_chunk_pages must be positive.")
         if self.offload_chunk_pages <= 0:
             raise ValueError("KVCR offload_chunk_pages must be positive.")
+        if self.max_cached_descriptor_pages < 0:
+            raise ValueError("KVCR max_cached_descriptor_pages must be nonnegative.")
         for name in (
             "max_inflight_prepare_requests",
             "max_inflight_prepare_bytes",

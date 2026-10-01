@@ -14,6 +14,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import lru_cache
 from queue import Empty, SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -543,6 +544,43 @@ def harness():
 # ---------------------------------------------------------------------------
 
 
+def test_descriptor_cache_reuses_pool_rows_without_sharing_mutable_lists():
+    linker = KVCRDirectLinker.__new__(KVCRDirectLinker)
+    linker.agent_name = "descriptor-agent"
+    linker._descriptor_cache = lru_cache(maxsize=2)(linker._build_descriptors)
+    linker.layouts = {
+        pool: SimpleNamespace(
+            mem_type="DRAM",
+            device_id=0,
+            spans=((base, 16, 8),),
+            labels=(f"{pool}:0.0",),
+        )
+        for pool, base in (("kv", 1024), ("state", 2048))
+    }
+    first = linker._descriptors("kv", 1)
+    repeated = linker._descriptors("kv", 1)
+    assert repeated is not first and repeated[0] is first[0]
+    first.clear()
+    repeated.append(repeated[0])
+    assert linker._descriptors("kv", 1) == repeated[:1]
+    for pool, row, address in (("kv", 1, 1040), ("kv", 2, 1056), ("state", 1, 2064)):
+        descriptor = linker._descriptors(pool, row)[0]
+        assert (descriptor.addr, descriptor.info, descriptor.end_point_name) == (
+            address,
+            f"{pool}:0.0",
+            "descriptor-agent",
+        )
+        if (pool, row) != ("kv", 1):
+            assert descriptor is not repeated[0]
+    rebuilt = linker._descriptors("kv", 1)[0]
+    assert rebuilt == repeated[0] and rebuilt is not repeated[0]
+    assert linker._descriptor_cache.cache_info().currsize == 2
+    linker._descriptor_cache = lru_cache(maxsize=0)(linker._build_descriptors)
+    uncached = linker._descriptors("kv", 1)[0]
+    assert linker._descriptors("kv", 1)[0] is not uncached
+    assert linker._descriptor_cache.cache_info().currsize == 0
+
+
 def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     from kvcr.types import RegDescriptor
 
@@ -1016,7 +1054,14 @@ def test_reset_clears_local_residency(harness):
     h.fill(0, 2, seed=11)
     h.offload(hashes, first_page=0)
     h.wait_offloads(1)
+    pool = next(iter(h.linker.layouts))
+    old_descriptor = h.linker._descriptors(pool, 0)[0]
     h.linker.reset()
+    descriptor = h.linker._descriptors(pool, 0)[0]
+    assert descriptor is not old_descriptor
+    assert descriptor.end_point_name == h.linker.agent_name
+    assert descriptor.end_point_name != old_descriptor.end_point_name
+    assert descriptor.addr == old_descriptor.addr
     handle = h.prepare("r13", hashes)
     h.wait_ready(handle)
     assert h.linker.lookup("r13", h.lookup_transfers(hashes)) == []
@@ -1170,6 +1215,10 @@ def test_config_rejects_unknown_and_unsafe_options():
     assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).eviction_policy == "lru"
     assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).max_inflight_restore_ops == 8
     assert (
+        KVCRLinkerConfig(local_dram_bytes_per_worker=1).max_cached_descriptor_pages
+        == 4096
+    )
+    assert (
         KVCRLinkerConfig.from_extra_config(
             {"local_dram_bytes_per_worker": 1, "max_inflight_restore_ops": 2}
         ).max_inflight_restore_ops
@@ -1179,6 +1228,18 @@ def test_config_rejects_unknown_and_unsafe_options():
         with pytest.raises(ValueError, match="max_inflight_restore_ops"):
             KVCRLinkerConfig.from_extra_config(
                 {"local_dram_bytes_per_worker": 1, "max_inflight_restore_ops": limit}
+            )
+    for limit in (0, 2):
+        assert (
+            KVCRLinkerConfig.from_extra_config(
+                {"local_dram_bytes_per_worker": 1, "max_cached_descriptor_pages": limit}
+            ).max_cached_descriptor_pages
+            == limit
+        )
+    for limit in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="max_cached_descriptor_pages"):
+            KVCRLinkerConfig.from_extra_config(
+                {"local_dram_bytes_per_worker": 1, "max_cached_descriptor_pages": limit}
             )
     with pytest.raises(ValueError, match="eviction_policy"):
         KVCRLinkerConfig.from_extra_config(

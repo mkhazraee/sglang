@@ -548,50 +548,56 @@ def test_descriptor_cache_reuses_pool_rows_without_sharing_mutable_lists():
     linker = KVCRDirectLinker.__new__(KVCRDirectLinker)
     linker.agent_name = "descriptor-agent"
     linker._descriptor_cache = lru_cache(maxsize=2)(linker._build_descriptors)
-    linker.layouts = {
-        pool: SimpleNamespace(
-            mem_type="DRAM",
-            device_id=0,
-            spans=((base, 16, 8),),
-            labels=(f"{pool}:0.0",),
-        )
-        for pool, base in (("kv", 1024), ("state", 2048))
+    linker.pools = {
+        "kv": SimpleNamespace(_row_span=2),
+        "mamba": SimpleNamespace(_row_span=1),
     }
-    first = linker._descriptors("kv", 1)
-    repeated = linker._descriptors("kv", 1)
+    linker.layouts = {
+        pool: SimpleNamespace(labels=(f"{pool}:0.0",)) for pool in ("kv", "mamba")
+    }
+    first = linker._descriptors("kv", 2)
+    repeated = linker._descriptors("kv", 2)
     assert repeated is not first and repeated[0] is first[0]
     first.clear()
     repeated.append(repeated[0])
-    assert linker._descriptors("kv", 1) == repeated[:1]
-    for pool, row, address in (("kv", 1, 1040), ("kv", 2, 1056), ("state", 1, 2064)):
+    assert linker._descriptors("kv", 2) == repeated[:1]
+    for pool, row, index in (
+        ("kv", 2, 1),
+        ("kv", 4, 2),
+        ("mamba", 1, 1),
+    ):
         descriptor = linker._descriptors(pool, row)[0]
-        assert (descriptor.addr, descriptor.info, descriptor.end_point_name) == (
-            address,
+        assert (
+            descriptor.element_index,
+            descriptor.info,
+            descriptor.end_point_name,
+        ) == (
+            index,
             f"{pool}:0.0",
             "descriptor-agent",
         )
-        if (pool, row) != ("kv", 1):
+        if (pool, row) != ("kv", 2):
             assert descriptor is not repeated[0]
-    rebuilt = linker._descriptors("kv", 1)[0]
+    rebuilt = linker._descriptors("kv", 2)[0]
     assert rebuilt == repeated[0] and rebuilt is not repeated[0]
     assert linker._descriptor_cache.cache_info().currsize == 2
     linker._descriptor_cache = lru_cache(maxsize=0)(linker._build_descriptors)
-    uncached = linker._descriptors("kv", 1)[0]
-    assert linker._descriptors("kv", 1)[0] is not uncached
+    uncached = linker._descriptors("kv", 2)[0]
+    assert linker._descriptors("kv", 2)[0] is not uncached
     assert linker._descriptor_cache.cache_info().currsize == 0
 
 
 def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
-    from kvcr.types import RegDescriptor
+    from kvcr.types import RegionDescriptor
 
     h = harness()
     regions = h.linker._framework_regions
     assert len(regions) == 2 * LAYERS
-    assert all(isinstance(region, RegDescriptor) for region in regions)
+    assert all(isinstance(region, RegionDescriptor) for region in regions)
     assert {(r.size, r.stride, r.count) for r in regions} == {
         (PAGE * ROW_BYTES, PAGE * ROW_BYTES, 64 // PAGE)
     }
-    assert {r.info for r in regions} == {"kv"}
+    assert [r.info for r in regions] == list(h.linker.layouts["kv"].labels)
     assert len(set(h.linker.layouts["kv"].labels)) == 2 * LAYERS
     assert h.linker.plan.pool_layouts == (("kv", PAGE * ROW_BYTES),)
     assert len(h.agent.prep_calls) == 2  # Initiator and loopback, once at startup.
@@ -626,7 +632,7 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
 
 @pytest.mark.parametrize("rows_are_pages", [False, True])
 def test_framework_registration_matches_page_geometry(rows_are_pages):
-    from kvcr.types import RegDescriptor
+    from kvcr.types import RegionDescriptor
 
     from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import build_pool_object_layouts
 
@@ -644,22 +650,29 @@ def test_framework_registration_matches_page_geometry(rows_are_pages):
     )
     linker = KVCRDirectLinker.__new__(KVCRDirectLinker)
     linker.pool_group = DevicePoolGroup([entry], LAYERS, PAGE)
+    linker.pools = linker.pool_group.entry_map
+    linker.agent_name = "registration-agent"
     linker.layouts = build_pool_object_layouts(linker.pool_group)
     regions = linker._build_framework_regions()
     row_span = 1 if rows_are_pages else PAGE
     assert len(regions) == LAYERS
     for layer, region in enumerate(regions):
-        assert isinstance(region, RegDescriptor)
+        assert isinstance(region, RegionDescriptor)
         assert region.addr == buffers[layer].data_ptr()
         assert region.size == buffers[layer].shape[1] * row_span
         assert region.stride == buffers[layer].stride(0) * row_span
         assert region.count == len(buffers[layer]) // row_span
-        assert region.info == "kv"
+        assert region.info == f"kv:0.{layer}"
         assert (region.mem_type, region.device_Id) == ("DRAM", 0)
         last = (region.count - 1) * row_span
         assert (
             region.addr + (region.count - 1) * region.stride
             == buffers[layer][last].data_ptr()
+        )
+        reference = linker._build_descriptors("kv", last)[layer]
+        assert (reference.element_index, reference.info) == (
+            region.count - 1,
+            f"kv:0.{layer}",
         )
 
 
@@ -1061,7 +1074,10 @@ def test_reset_clears_local_residency(harness):
     assert descriptor is not old_descriptor
     assert descriptor.end_point_name == h.linker.agent_name
     assert descriptor.end_point_name != old_descriptor.end_point_name
-    assert descriptor.addr == old_descriptor.addr
+    assert (descriptor.info, descriptor.element_index) == (
+        old_descriptor.info,
+        old_descriptor.element_index,
+    )
     handle = h.prepare("r13", hashes)
     h.wait_ready(handle)
     assert h.linker.lookup("r13", h.lookup_transfers(hashes)) == []

@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.storage.kvcr.kvcr_layout import (
     carve_local_dram,
     compatibility_digest_for,
     compatibility_identity,
-    page_descriptors,
     plan_capacity,
     restorable_boundaries,
 )
@@ -662,19 +661,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
 
     def _build_framework_regions(self):
-        from kvcr.types import RegDescriptor
+        from kvcr.types import RegionDescriptor
 
         regions = []
         for entry in self.pool_group.entries:
             layout = self.layouts[str(entry.name)]
             for (address, row_stride, size), label in zip(layout.spans, layout.labels):
                 regions.append(
-                    RegDescriptor(
+                    RegionDescriptor(
                         address,
                         size,
                         layout.mem_type,
                         layout.device_id,
-                        info=label.partition(":")[0],
+                        info=label,
                         stride=row_stride * entry._row_span,
                         count=entry._row_count // entry._row_span,
                     )
@@ -804,16 +803,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return encode_object_key(page_hash, self.digest, pool)
 
     def _descriptors(self, pool: str, row: int) -> list:
-        # Pool addresses/layouts stay fixed until teardown. Cache by physical
+        # Registered regions stay fixed until teardown. Cache by physical
         # row, independent of the request or tokens currently occupying it.
         # Give each operation its own list around the immutable descriptors.
         return list(self._descriptor_cache(pool, row))
 
     def _build_descriptors(self, pool: str, row: int) -> tuple:
-        from kvcr.types import MemDescriptor
+        from kvcr.types import MemoryRef
 
+        index = row // self.pools[PoolName(pool)]._row_span
         return tuple(
-            page_descriptors(self.layouts[pool], row, self.agent_name, MemDescriptor)
+            MemoryRef(self.agent_name, index, label)
+            for label in self.layouts[pool].labels
         )
 
     def _rows(self, pool: str, indices: torch.Tensor) -> list[int]:

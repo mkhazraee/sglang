@@ -228,23 +228,6 @@ def carve_local_dram(
     return regions
 
 
-def page_descriptors(
-    layout: PoolObjectLayout, row: int, agent_name: str, descriptor_type: Any
-) -> list:
-    """Descriptor list for one page row of a pool, in layout order."""
-    return [
-        descriptor_type(
-            end_point_name=agent_name,
-            mem_type=layout.mem_type,
-            addr=base_ptr + row * row_stride,
-            size=size,
-            device_Id=layout.device_id,
-            info=label,
-        )
-        for (base_ptr, row_stride, size), label in zip(layout.spans, layout.labels)
-    ]
-
-
 def compatibility_identity(
     *,
     model_path: str,

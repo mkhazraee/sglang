@@ -587,6 +587,30 @@ def test_descriptor_cache_reuses_pool_rows_without_sharing_mutable_lists():
     assert linker._descriptor_cache.cache_info().currsize == 0
 
 
+def test_index_snapshots_preserve_pool_rows_and_refresh_between_operations():
+    linker = KVCRDirectLinker.__new__(KVCRDirectLinker)
+    group, _ = _pool_group(with_swa=True)
+    linker.pools = group.entry_map
+    linker.pools[PoolName.SWA]._row_span = 1  # Page rows versus KV token rows.
+    indices = torch.tensor([0, 1, 2, 3])
+    snapshots = {}
+    cpu_indices = linker_module._cpu_indices
+    # Model a GPU-to-CPU copy's independent storage using CPU tensors.
+    with patch.object(
+        linker_module, "_cpu_indices", side_effect=lambda x: cpu_indices(x).clone()
+    ) as copy:
+        assert linker._rows("kv", indices, snapshots) == [0, 2]
+        assert linker._rows("swa", indices, snapshots) == [0, 1]
+        assert copy.call_count == 1
+        # A distinct view of the same storage still needs its own snapshot.
+        tail = indices[PAGE:]
+        assert linker._rows("kv", tail, snapshots) == [2]
+        assert copy.call_count == 2
+        indices.add_(4)
+        assert linker._rows("kv", indices, {}) == [4, 6]
+        assert copy.call_count == 3
+
+
 def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     from kvcr.types import RegionDescriptor
 
@@ -1769,7 +1793,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
     owner.layouts = {
         pool: SimpleNamespace(mem_type="VRAM", device_id=0) for pool in ("kv", "swa")
     }
-    owner._rows = lambda pool, indices: indices.tolist()
+    owner._rows = lambda pool, indices, snapshots: indices.tolist()
     owner._key = lambda page, pool: (pool, page)
     owner._descriptors = lambda pool, row: [0, 1, 2] if pool == "kv" else [0]
     released, discarded, submitted, pending = [], [], [], {}

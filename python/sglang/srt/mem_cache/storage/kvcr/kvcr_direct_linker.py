@@ -817,10 +817,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             for label in self.layouts[pool].labels
         )
 
-    def _rows(self, pool: str, indices: torch.Tensor) -> list[int]:
-        # Called after the producer event completes. The ordinary synchronous
-        # torch copy makes these indices usable by CPU descriptor construction.
-        return self.pools[PoolName(pool)].prepare_locations(_cpu_indices(indices))
+    def _rows(
+        self, pool: str, indices: torch.Tensor, snapshots: dict[int, torch.Tensor]
+    ) -> list[int]:
+        # Called after the producer event completes. Pools sharing the same
+        # tensor reuse its CPU snapshot, but retain their own row translation.
+        identity = id(indices)
+        if identity not in snapshots:
+            snapshots[identity] = _cpu_indices(indices)
+        return self.pools[PoolName(pool)].prepare_locations(snapshots[identity])
 
     # ------------------------------------------------------------------
     # Preparation (scheduler thread -> owner thread)
@@ -1360,10 +1365,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         try:
             per_layer = collections.defaultdict(list)
             last_chunks = {}
+            snapshots = {}
             chunk = self.config.fetch_chunk_pages
             for pool in batch.pools:
                 layout = self.layouts[pool.pool]
-                rows = self._rows(pool.pool, pool.indices)
+                rows = self._rows(pool.pool, pool.indices, snapshots)
                 if len(rows) != len(pool.page_hashes):
                     raise RuntimeError(
                         f"KVCR load pool={pool.pool} rows do not match pages"
@@ -1528,9 +1534,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """
         chunk = self.config.offload_chunk_pages
         chunks: list[list[tuple[str, list[str], list[int]]]] = []
+        snapshots = {}
         for transfer in task.transfers:
             pool = str(transfer.name)
-            rows = self._rows(pool, transfer.host_indices)
+            rows = self._rows(pool, transfer.host_indices, snapshots)
             pages = list(transfer.keys or [])
             if len(rows) != len(pages):
                 raise RuntimeError(

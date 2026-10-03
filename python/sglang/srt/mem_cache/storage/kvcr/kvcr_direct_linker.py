@@ -669,11 +669,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             for (address, row_stride, size), label in zip(layout.spans, layout.labels):
                 regions.append(
                     RegionDescriptor(
-                        address,
-                        size,
-                        layout.mem_type,
-                        layout.device_id,
-                        info=label,
+                        addr=address,
+                        size=size,
+                        mem_type=layout.mem_type,
+                        device_Id=layout.device_id,
+                        label=label,
                         stride=row_stride * entry._row_span,
                         count=entry._row_count // entry._row_span,
                     )
@@ -813,7 +813,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
         index = row // self.pools[PoolName(pool)]._row_span
         return tuple(
-            MemoryRef(self.agent_name, index, label)
+            MemoryRef(end_point_name=self.agent_name, element_index=index, label=label)
             for label in self.layouts[pool].labels
         )
 

@@ -569,7 +569,7 @@ def test_descriptor_cache_reuses_pool_rows_without_sharing_mutable_lists():
         descriptor = linker._descriptors(pool, row)[0]
         assert (
             descriptor.element_index,
-            descriptor.info,
+            descriptor.label,
             descriptor.end_point_name,
         ) == (
             index,
@@ -597,7 +597,7 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     assert {(r.size, r.stride, r.count) for r in regions} == {
         (PAGE * ROW_BYTES, PAGE * ROW_BYTES, 64 // PAGE)
     }
-    assert [r.info for r in regions] == list(h.linker.layouts["kv"].labels)
+    assert [r.label for r in regions] == list(h.linker.layouts["kv"].labels)
     assert len(set(h.linker.layouts["kv"].labels)) == 2 * LAYERS
     assert h.linker.plan.pool_layouts == (("kv", PAGE * ROW_BYTES),)
     assert len(h.agent.prep_calls) == 2  # Initiator and loopback, once at startup.
@@ -662,7 +662,7 @@ def test_framework_registration_matches_page_geometry(rows_are_pages):
         assert region.size == buffers[layer].shape[1] * row_span
         assert region.stride == buffers[layer].stride(0) * row_span
         assert region.count == len(buffers[layer]) // row_span
-        assert region.info == f"kv:0.{layer}"
+        assert region.label == f"kv:0.{layer}"
         assert (region.mem_type, region.device_Id) == ("DRAM", 0)
         last = (region.count - 1) * row_span
         assert (
@@ -670,7 +670,7 @@ def test_framework_registration_matches_page_geometry(rows_are_pages):
             == buffers[layer][last].data_ptr()
         )
         reference = linker._build_descriptors("kv", last)[layer]
-        assert (reference.element_index, reference.info) == (
+        assert (reference.element_index, reference.label) == (
             region.count - 1,
             f"kv:0.{layer}",
         )
@@ -1074,8 +1074,8 @@ def test_reset_clears_local_residency(harness):
     assert descriptor is not old_descriptor
     assert descriptor.end_point_name == h.linker.agent_name
     assert descriptor.end_point_name != old_descriptor.end_point_name
-    assert (descriptor.info, descriptor.element_index) == (
-        old_descriptor.info,
+    assert (descriptor.label, descriptor.element_index) == (
+        old_descriptor.label,
         old_descriptor.element_index,
     )
     handle = h.prepare("r13", hashes)

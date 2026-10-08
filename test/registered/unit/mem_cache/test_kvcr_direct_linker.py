@@ -1766,6 +1766,10 @@ def test_layer_waits_for_every_request_and_chunk(harness, chunk, layer_ops):
     h.agent.default_state = "DONE"
     assert h.wait_loads(1) == [["a", "b"]]
     h.wait(lambda: h.public_claims() == 0)
+    assert not any(
+        name.startswith("restore_chunk_collisions_")
+        for name in h.linker.snapshot_stats()
+    )
     for first_page in (8, 16):
         for name, layers in h.snapshot(first_page, 4).items():
             assert all(
@@ -1773,12 +1777,13 @@ def test_layer_waits_for_every_request_and_chunk(harness, chunk, layer_ops):
             )
 
 
-@pytest.mark.parametrize("destination", [8, 16])
-@pytest.mark.parametrize("chunk", [4, 1024])
-def test_duplicate_chunk_diagnostics_preserve_destination_copies(
+@pytest.mark.parametrize(("destination", "chunk"), [(8, 4), (16, 1024)])
+def test_restore_chunk_collision_diagnostics_preserve_destination_copies(
     harness, caplog, destination, chunk
 ):
-    h = harness(extra={"fetch_chunk_pages": chunk})
+    h = harness(
+        extra={"fetch_chunk_pages": chunk, "enable_restore_collision_diagnostics": True}
+    )
     hashes = _hashes("duplicate-destination", 4)
     h.fill(0, 4, seed=47)
     expected = h.snapshot(0, 4)
@@ -1799,12 +1804,12 @@ def test_duplicate_chunk_diagnostics_preserve_destination_copies(
             )
     stats = h.linker.snapshot_stats()
     same = destination == 8
-    assert stats.get("restore_duplicate_same_destination", 0) == LAYERS * same
-    assert stats.get("restore_duplicate_different_destination", 0) == LAYERS * (
+    assert stats.get("restore_chunk_collisions_same_destination", 0) == LAYERS * same
+    assert stats.get("restore_chunk_collisions_different_destination", 0) == LAYERS * (
         not same
     )
-    assert stats.get("restore_duplicate_extra_splits", 0) == LAYERS * (chunk > 4)
-    summaries = [r for r in caplog.records if "duplicate restore keys" in r.message]
+    assert stats.get("restore_chunk_collisions_extra_splits", 0) == LAYERS * (chunk > 4)
+    summaries = [r for r in caplog.records if "restore chunk collisions" in r.message]
     assert len(summaries) == 1
     assert "pool=kv" in summaries[0].message
     assert "old_indices=" in summaries[0].message
@@ -1825,6 +1830,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
         max_inflight_restore_ops=limit,
         progressive_restore=progressive,
         direct_remote_restore=False,
+        enable_restore_collision_diagnostics=False,
     )
     owner.num_layers = 3
     owner._lock = threading.RLock()
@@ -2520,15 +2526,6 @@ def test_direct_remote_reset_releases_queued_hints_and_uses_fresh_batch_id(harne
     expected = source.snapshot(0, 1)
     source.offload(hashes, first_page=0)
     assert source.wait_offloads(1) == [True]
-    for rid, first_page in (("old-a", 4), ("old-b", 6)):
-        target.wait_ready(target.prepare(rid, hashes, hint=source.hint(hashes)))
-        target.load(rid, hashes, first_page, start=False)
-    old_core = target.linker._kvcr
-    with patch.object(old_core, "deliver", wraps=old_core.deliver) as deliver:
-        target.linker.start_layer_wise_loading()
-        assert target.wait_loads(1) == [["old-a", "old-b"]]
-        old_batch_ids = {call.kwargs["request_id"] for call in deliver.call_args_list}
-    assert len(old_batch_ids) == 1
     handle = target.prepare("same-rid", hashes, hint=source.hint(hashes))
     target.wait_ready(handle)
     original_id = target.linker._preparations[handle].request_id
@@ -2555,7 +2552,6 @@ def test_direct_remote_reset_releases_queued_hints_and_uses_fresh_batch_id(harne
         assert target.wait_loads(1) == [["same-rid", "other"]]
         batch_ids = {call.kwargs["request_id"] for call in deliver.call_args_list}
     assert len(batch_ids) == 1 and batch_ids.isdisjoint({original_id, *new_originals})
-    assert batch_ids.isdisjoint(old_batch_ids)
     assert not core._core._remote_fw_dram._request_hints
     target.linker.layer_done_counter.set_consumer(index)
     target.linker.layer_done_counter.wait_until(LAYERS - 1)

@@ -1403,8 +1403,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         """Deliver claimed objects by logical layer through public KVCR calls."""
         self._record_timing("restore_wait", batch.requested_at)
         build_started = self._time()
-        duplicate_same = duplicate_different = duplicate_extra_splits = 0
-        duplicate_sample = None
+        diagnostics = self.config.enable_restore_collision_diagnostics
+        collisions_same = collisions_different = collision_extra_splits = 0
+        collision_sample = None
         try:
             self._handoff_load_hints(batch)
             per_layer = collections.defaultdict(list)
@@ -1427,17 +1428,17 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     blocks = last_chunks.get(group)
                     for key, descriptors in pages:
                         selected = [descriptors[index] for index in indices]
-                        duplicate = blocks is not None and key in blocks
-                        if duplicate:
+                        collision = blocks is not None and key in blocks
+                        if collision and diagnostics:
                             old = blocks[key]
                             same_destination = old == selected
-                            duplicate_same += same_destination
-                            duplicate_different += not same_destination
-                            duplicate_extra_splits += len(blocks) < chunk
-                            if duplicate_sample is None and logger.isEnabledFor(
+                            collisions_same += same_destination
+                            collisions_different += not same_destination
+                            collision_extra_splits += len(blocks) < chunk
+                            if collision_sample is None and logger.isEnabledFor(
                                 logging.DEBUG
                             ):
-                                duplicate_sample = (
+                                collision_sample = (
                                     pool.pool,
                                     layer,
                                     [ref.element_index for ref in old[:4]],
@@ -1445,7 +1446,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                                 )
                         # Share chunks across compatible pools, but preserve
                         # repeated keys targeting different destination rows.
-                        if blocks is None or len(blocks) == chunk or duplicate:
+                        if blocks is None or len(blocks) == chunk or collision:
                             blocks = last_chunks[group] = {}
                             per_layer[layer].append((pool.request_id, blocks))
                         blocks[key] = selected
@@ -1467,24 +1468,26 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch.error = error
             logger.exception("KVCR load submission failed")
         finally:
-            if duplicate_same or duplicate_different:
+            if collisions_same or collisions_different:
                 with self._lock:
-                    self.stats["restore_duplicate_same_destination"] += duplicate_same
-                    self.stats["restore_duplicate_different_destination"] += (
-                        duplicate_different
+                    self.stats["restore_chunk_collisions_same_destination"] += (
+                        collisions_same
                     )
-                    self.stats["restore_duplicate_extra_splits"] += (
-                        duplicate_extra_splits
+                    self.stats["restore_chunk_collisions_different_destination"] += (
+                        collisions_different
                     )
-                if duplicate_sample is not None:
+                    self.stats["restore_chunk_collisions_extra_splits"] += (
+                        collision_extra_splits
+                    )
+                if collision_sample is not None:
                     logger.debug(
-                        "KVCR duplicate restore keys: same_destination=%d "
+                        "KVCR restore chunk collisions: same_destination=%d "
                         "different_destination=%d extra_splits=%d; "
                         "sample pool=%s layer=%d old_indices=%s new_indices=%s",
-                        duplicate_same,
-                        duplicate_different,
-                        duplicate_extra_splits,
-                        *duplicate_sample,
+                        collisions_same,
+                        collisions_different,
+                        collision_extra_splits,
+                        *collision_sample,
                     )
         self._refill_load(batch)
 

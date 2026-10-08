@@ -56,6 +56,8 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     fetch_chunk_pages: int = 32
     # Per restore batch, shared across requests, pools, and page chunks.
     max_inflight_restore_ops: int = 8
+    # Count same-key collisions within restore chunks, not every repeated key.
+    enable_restore_collision_diagnostics: bool = False
     # Physical-page descriptor lists retained across transfers; 0 disables reuse.
     max_cached_descriptor_pages: int = 4096
     # Bound the amount of work submitted by a single offload operation.

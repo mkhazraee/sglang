@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     KVCRLinkerKeyAdapter,
     encode_object_key,
     offset_control_endpoint,
+    page_hash_event_int,
     page_hash_to_int64,
     parse_fetch_hint,
     unique_page_hashes_from_keys,
@@ -311,6 +312,7 @@ class _LoadPool:
         claims: list[int],
         request_id: Optional[str] = None,
         requested_at: Optional[float] = None,
+        hint: Optional[KVCRFetchHint] = None,
     ):
         self.pool = pool
         self.page_hashes = page_hashes
@@ -318,6 +320,7 @@ class _LoadPool:
         self.claims = claims
         self.request_id = request_id
         self.requested_at = requested_at
+        self.hint = hint
 
 
 class _LoadBatch:
@@ -1300,6 +1303,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         claims,
                         prep.request_id if self.config.direct_remote_restore else None,
                         requested_at,
+                        prep.hint if self.config.direct_remote_restore else None,
                     )
                 )
             leftover = list(prep.claims.values())
@@ -1358,11 +1362,51 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         else:
             self._deferred.append((event, submit))
 
+    def _handoff_load_hints(self, batch: _LoadBatch) -> None:
+        """Replace preparation scopes with one retained route per resolved peer."""
+        if not self.config.direct_remote_restore:
+            return
+        routes = collections.defaultdict(list)
+        for pool in batch.pools:
+            if pool.hint is not None:
+                routes[pool.hint.source_control_endpoint].append(pool)
+        for endpoint, pools in routes.items():
+            originals = {pool.request_id for pool in pools}
+            if len(originals) == 1:
+                continue
+            request_id = f"restore#{uuid.uuid4().hex}"
+            hint = KVCRFetchHint(
+                source_control_endpoint=endpoint,
+                block_hashes=tuple(
+                    dict.fromkeys(
+                        page_hash_event_int(page)
+                        for pool in pools
+                        for page in pool.page_hashes
+                    )
+                ),
+            )
+            try:
+                self._adapter.kvcr.submit_hint(
+                    hint.to_kvcr_hint(), request_id=request_id
+                )
+            except Exception:
+                # Registration may have installed a scope before raising.
+                self._discard_hint(request_id)
+                raise
+            for pool in pools:
+                pool.request_id = request_id
+                pool.hint = None
+            for original in originals:
+                self._discard_hint(original)
+
     def _submit_load(self, batch: _LoadBatch) -> None:
         """Deliver claimed objects by logical layer through public KVCR calls."""
         self._record_timing("restore_wait", batch.requested_at)
         build_started = self._time()
+        duplicate_same = duplicate_different = duplicate_extra_splits = 0
+        duplicate_sample = None
         try:
+            self._handoff_load_hints(batch)
             per_layer = collections.defaultdict(list)
             last_chunks = {}
             snapshots = {}
@@ -1382,12 +1426,29 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     group = (layer, pool.request_id, layout.mem_type, layout.device_id)
                     blocks = last_chunks.get(group)
                     for key, descriptors in pages:
+                        selected = [descriptors[index] for index in indices]
+                        duplicate = blocks is not None and key in blocks
+                        if duplicate:
+                            old = blocks[key]
+                            same_destination = old == selected
+                            duplicate_same += same_destination
+                            duplicate_different += not same_destination
+                            duplicate_extra_splits += len(blocks) < chunk
+                            if duplicate_sample is None and logger.isEnabledFor(
+                                logging.DEBUG
+                            ):
+                                duplicate_sample = (
+                                    pool.pool,
+                                    layer,
+                                    [ref.element_index for ref in old[:4]],
+                                    [ref.element_index for ref in selected[:4]],
+                                )
                         # Share chunks across compatible pools, but preserve
                         # repeated keys targeting different destination rows.
-                        if blocks is None or len(blocks) == chunk or key in blocks:
+                        if blocks is None or len(blocks) == chunk or duplicate:
                             blocks = last_chunks[group] = {}
                             per_layer[layer].append((pool.request_id, blocks))
-                        blocks[key] = [descriptors[index] for index in indices]
+                        blocks[key] = selected
             self._record_timing("restore_build", build_started)
             batch.copy_started_at = self._time()
             for layer in range(self.num_layers):
@@ -1405,6 +1466,26 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch.success = False
             batch.error = error
             logger.exception("KVCR load submission failed")
+        finally:
+            if duplicate_same or duplicate_different:
+                with self._lock:
+                    self.stats["restore_duplicate_same_destination"] += duplicate_same
+                    self.stats["restore_duplicate_different_destination"] += (
+                        duplicate_different
+                    )
+                    self.stats["restore_duplicate_extra_splits"] += (
+                        duplicate_extra_splits
+                    )
+                if duplicate_sample is not None:
+                    logger.debug(
+                        "KVCR duplicate restore keys: same_destination=%d "
+                        "different_destination=%d extra_splits=%d; "
+                        "sample pool=%s layer=%d old_indices=%s new_indices=%s",
+                        duplicate_same,
+                        duplicate_different,
+                        duplicate_extra_splits,
+                        *duplicate_sample,
+                    )
         self._refill_load(batch)
 
     def _refill_load(self, batch: _LoadBatch) -> None:

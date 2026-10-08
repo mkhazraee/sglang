@@ -466,7 +466,13 @@ class Harness:
         self.wait(lambda: self.linker.preparation_ready(handle))
 
     def load(
-        self, rid: str, hashes: list[str], first_page: int, *, swa_tail: int = 0
+        self,
+        rid: str,
+        hashes: list[str],
+        first_page: int,
+        *,
+        swa_tail: int = 0,
+        start: bool = True,
     ) -> int:
         transfers = [
             PoolTransfer(
@@ -487,7 +493,7 @@ class Harness:
                 )
             )
         assert self.linker.load(rid, transfers)
-        return self.linker.start_layer_wise_loading()
+        return self.linker.start_layer_wise_loading() if start else -1
 
     def wait_loads(self, count: int) -> list[list[str]]:
         self.wait(lambda: self.linker.num_completed_loads() >= count)
@@ -1767,6 +1773,44 @@ def test_layer_waits_for_every_request_and_chunk(harness, chunk, layer_ops):
             )
 
 
+@pytest.mark.parametrize("destination", [8, 16])
+@pytest.mark.parametrize("chunk", [4, 1024])
+def test_duplicate_chunk_diagnostics_preserve_destination_copies(
+    harness, caplog, destination, chunk
+):
+    h = harness(extra={"fetch_chunk_pages": chunk})
+    hashes = _hashes("duplicate-destination", 4)
+    h.fill(0, 4, seed=47)
+    expected = h.snapshot(0, 4)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    for rid, first_page in (("a", 8), ("b", destination)):
+        h.wait_ready(h.prepare(rid, hashes))
+        h.load(rid, hashes, first_page, start=False)
+    with caplog.at_level("DEBUG", logger=linker_module.__name__):
+        index = h.linker.start_layer_wise_loading()
+        assert h.wait_loads(1) == [["a", "b"]]
+    h.linker.layer_done_counter.set_consumer(index)
+    h.linker.layer_done_counter.wait_until(LAYERS - 1)
+    for first_page in {8, destination}:
+        for name, layers in h.snapshot(first_page, 4).items():
+            assert all(
+                torch.equal(got, want) for got, want in zip(layers, expected[name])
+            )
+    stats = h.linker.snapshot_stats()
+    same = destination == 8
+    assert stats.get("restore_duplicate_same_destination", 0) == LAYERS * same
+    assert stats.get("restore_duplicate_different_destination", 0) == LAYERS * (
+        not same
+    )
+    assert stats.get("restore_duplicate_extra_splits", 0) == LAYERS * (chunk > 4)
+    summaries = [r for r in caplog.records if "duplicate restore keys" in r.message]
+    assert len(summaries) == 1
+    assert "pool=kv" in summaries[0].message
+    assert "old_indices=" in summaries[0].message
+    assert "new_indices=" in summaries[0].message
+
+
 @pytest.mark.parametrize("limit", [1, 2])
 @pytest.mark.parametrize("progressive", [False, True])
 @pytest.mark.parametrize("failure", [None, "submission", "entry"])
@@ -1780,6 +1824,7 @@ def test_restore_window_bounds_work_and_drains_failures(limit, progressive, fail
         fetch_chunk_pages=3,
         max_inflight_restore_ops=limit,
         progressive_restore=progressive,
+        direct_remote_restore=False,
     )
     owner.num_layers = 3
     owner._lock = threading.RLock()
@@ -2144,6 +2189,84 @@ def test_direct_budget_counts_only_selected_window(harness, pages):
     )
 
 
+@pytest.mark.parametrize("peer_count", [1, 2])
+def test_direct_remote_batch_routes_merge_same_peer_and_hold_union_hint(
+    harness, peer_count
+):
+    network = FakePeerNetwork()
+    sources = [harness(network=network) for _ in range(peer_count)]
+    target = harness(
+        network=network,
+        extra={
+            "direct_remote_restore": True,
+            "fetch_chunk_pages": 1024,
+            "max_inflight_restore_ops": 1,
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+        },
+    )
+    hashes = [_hashes(f"merged-peer-{i}", 2) for i in range(2)]
+    expected = []
+    original_ids = set()
+    for i, pages in enumerate(hashes):
+        source = sources[i % peer_count]
+        source.fill(i * 2, 2, seed=53 + i)
+        expected.append(source.snapshot(i * 2, 2))
+        source.offload(pages, first_page=i * 2)
+        assert source.wait_offloads(1) == [True]
+        handle = target.prepare(str(i), pages, hint=source.hint(pages))
+        target.wait_ready(handle)
+        original_ids.add(target.linker._preparations[handle].request_id)
+        target.load(str(i), pages, 8 + i * 8, start=False)
+    core = target.linker._kvcr
+    hints = core._core._remote_fw_dram._request_hints
+    agents = [h.agent for h in [*sources, target]]
+    for agent in agents:
+        agent.default_state = "PROC"
+    try:
+        with patch.object(core, "deliver", wraps=core.deliver) as deliver:
+            index = target.linker.start_layer_wise_loading()
+            target.wait(lambda: deliver.call_count > 0)
+            batch_ids = set(hints)
+            assert len(batch_ids) == peer_count
+            if peer_count == 1:
+                assert batch_ids.isdisjoint(original_ids)
+            else:
+                assert batch_ids == original_ids
+            by_source = {hint.source: hint.block_hashes for hint in hints.values()}
+            for i, source in enumerate(sources):
+                assert by_source[source.linker.control_endpoint] == frozenset(
+                    normalize_block_hash(page)
+                    for j, pages in enumerate(hashes)
+                    if j % peer_count == i
+                    for page in pages
+                )
+            assert len(deliver.call_args.args[0]) == 4 // peer_count
+            futures = target.linker.layer_done_counter.futures[index]
+            assert not any(future.done() for future in futures)
+            assert target.linker.num_completed_loads() == 0
+            assert set(hints) == batch_ids
+            for agent in agents:
+                agent.default_state = "DONE"
+            assert target.wait_loads(1) == [["0", "1"]]
+            target.wait(lambda: not hints)
+            assert deliver.call_count == LAYERS * peer_count
+            assert {call.kwargs["request_id"] for call in deliver.call_args_list} == (
+                batch_ids
+            )
+        target.linker.layer_done_counter.set_consumer(index)
+        target.linker.layer_done_counter.wait_until(LAYERS - 1)
+        for i, want in enumerate(expected):
+            for name, layers in target.snapshot(8 + i * 8, 2).items():
+                assert all(
+                    torch.equal(got, ref) for got, ref in zip(layers, want[name])
+                )
+        assert target.public_claims() == 0
+    finally:
+        for agent in agents:
+            agent.default_state = "DONE"
+
+
 @pytest.mark.parametrize("evict_source", [False, True])
 def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_source):
     from kvcr.types import QueryStatus
@@ -2256,6 +2379,191 @@ def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_sou
                 )
         finally:
             source.agent.default_state = "DONE"
+
+
+@pytest.mark.parametrize("install_before_error", [False, True])
+def test_direct_remote_partial_hint_handoff_failure_cleans_all_scopes(
+    harness, install_before_error
+):
+    network = FakePeerNetwork()
+    sources = [harness(network=network) for _ in range(2)]
+    target = harness(network=network, extra={"direct_remote_restore": True})
+    originals = set()
+    for i in range(4):
+        source = sources[i % 2]
+        hashes = _hashes(f"handoff-failure-{i}", 1)
+        source.fill(i, 1, seed=59 + i)
+        source.offload(hashes, first_page=i)
+        assert source.wait_offloads(1) == [True]
+        handle = target.prepare(str(i), hashes, hint=source.hint(hashes))
+        target.wait_ready(handle)
+        originals.add(target.linker._preparations[handle].request_id)
+        target.load(str(i), hashes, 8 + i * 4, start=False)
+    core = target.linker._kvcr
+    hints = core._core._remote_fw_dram._request_hints
+    attempted = []
+    submit = core.submit_hint
+
+    def fail_second(envelope, *, request_id):
+        attempted.append(request_id)
+        # An original scope must survive until its replacement is installed.
+        source = parse_fetch_hint(envelope).source_control_endpoint
+        assert any(
+            hints[original].source == source for original in originals & hints.keys()
+        )
+        if len(attempted) == 2 and not install_before_error:
+            raise RuntimeError("injected hint handoff failure")
+        result = submit(envelope, request_id=request_id)
+        if len(attempted) == 2:
+            raise RuntimeError("injected hint handoff failure")
+        return result
+
+    with patch.object(core, "submit_hint", side_effect=fail_second):
+        index = target.linker.start_layer_wise_loading()
+        assert target.wait_loads(1) == [["0", "1", "2", "3"]]
+    assert len(attempted) == 2
+    assert set(attempted).isdisjoint(originals)
+    target.wait(lambda: not hints)
+    target.linker.layer_done_counter.set_consumer(index)
+    with pytest.raises(RuntimeError, match="layer-wise KV load failed"):
+        target.linker.layer_done_counter.wait_until(LAYERS - 1)
+    assert target.linker._unhealthy is not None
+    assert target.agent.xfers == []
+    assert target.public_claims() == 0
+
+
+def test_direct_remote_union_hint_survives_failure_and_failed_reset_until_drain(
+    harness,
+):
+    from msgspec.structs import replace
+
+    network = FakePeerNetwork()
+    source = harness(
+        network=network,
+        extra={"operation_timeout_ms": 5000, "abandon_timeout_ms": 10000},
+    )
+    target = harness(
+        network=network,
+        extra={
+            "direct_remote_restore": True,
+            "fetch_chunk_pages": 1024,
+            "max_inflight_restore_ops": 2,
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+        },
+    )
+    originals = set()
+    for i in range(2):
+        hashes = _hashes(f"union-drain-{i}", 1)
+        source.fill(i, 1, seed=61 + i)
+        source.offload(hashes, first_page=i)
+        assert source.wait_offloads(1) == [True]
+        handle = target.prepare(str(i), hashes, hint=source.hint(hashes))
+        target.wait_ready(handle)
+        originals.add(target.linker._preparations[handle].request_id)
+        target.load(str(i), hashes, 8 + i * 8, start=False)
+    core = target.linker._kvcr
+    hints = core._core._remote_fw_dram._request_hints
+    first = len(source.agent.xfers) + 1
+    source.agent.default_state = "PROC"
+    deliver = core.deliver
+    calls = 0
+
+    def fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected second-layer submission failure")
+        return deliver(*args, **kwargs)
+
+    try:
+        with patch.object(core, "deliver", side_effect=fail_second):
+            index = target.linker.start_layer_wise_loading()
+            source.wait(lambda: len(source.agent.xfers) == first)
+            target.wait(lambda: calls == 2)
+        batch_ids = set(hints)
+        assert len(batch_ids) == 1 and batch_ids.isdisjoint(originals)
+        assert target.linker._adapter.pending_ops == 1
+        assert set(hints) == batch_ids
+        assert target.linker.num_completed_loads() == 0
+        with patch.object(
+            target.linker,
+            "config",
+            replace(target.linker.config, operation_timeout_ms=20),
+        ):
+            with pytest.raises(RuntimeError, match="transfers did not drain"):
+                target.linker.reset()
+        assert target.linker._kvcr is core
+        assert set(hints) == batch_ids
+        source.agent.default_state = "DONE"
+        assert target.wait_loads(1) == [["0", "1"]]
+        target.wait(lambda: not hints)
+        target.linker.layer_done_counter.set_consumer(index)
+        with pytest.raises(RuntimeError, match="layer-wise KV load failed"):
+            target.linker.layer_done_counter.wait_until(LAYERS - 1)
+        for first_page in (8, 16):
+            for layer in (1, 2):
+                assert not torch.count_nonzero(
+                    target.buffers["k"][layer][first_page * PAGE]
+                )
+        assert target.public_claims() == 0
+    finally:
+        source.agent.default_state = "DONE"
+
+
+def test_direct_remote_reset_releases_queued_hints_and_uses_fresh_batch_id(harness):
+    network = FakePeerNetwork()
+    source = harness(network=network)
+    target = harness(network=network, extra={"direct_remote_restore": True})
+    hashes = _hashes("reset-union", 1)
+    source.fill(0, 1, seed=67)
+    expected = source.snapshot(0, 1)
+    source.offload(hashes, first_page=0)
+    assert source.wait_offloads(1) == [True]
+    for rid, first_page in (("old-a", 4), ("old-b", 6)):
+        target.wait_ready(target.prepare(rid, hashes, hint=source.hint(hashes)))
+        target.load(rid, hashes, first_page, start=False)
+    old_core = target.linker._kvcr
+    with patch.object(old_core, "deliver", wraps=old_core.deliver) as deliver:
+        target.linker.start_layer_wise_loading()
+        assert target.wait_loads(1) == [["old-a", "old-b"]]
+        old_batch_ids = {call.kwargs["request_id"] for call in deliver.call_args_list}
+    assert len(old_batch_ids) == 1
+    handle = target.prepare("same-rid", hashes, hint=source.hint(hashes))
+    target.wait_ready(handle)
+    original_id = target.linker._preparations[handle].request_id
+    target.load("same-rid", hashes, 8, start=False)
+    old_hints = target.linker._kvcr._core._remote_fw_dram._request_hints
+    assert original_id in old_hints
+
+    def build_control(linker):
+        return network.control(linker.control_endpoint)
+
+    with patch.object(KVCRDirectLinker, "_build_control_channel", new=build_control):
+        target.linker.reset()
+    assert not old_hints
+    new_originals = set()
+    for rid, first_page in (("same-rid", 8), ("other", 16)):
+        handle = target.prepare(rid, hashes, hint=source.hint(hashes))
+        target.wait_ready(handle)
+        new_originals.add(target.linker._preparations[handle].request_id)
+        target.load(rid, hashes, first_page, start=False)
+    assert original_id not in new_originals
+    core = target.linker._kvcr
+    with patch.object(core, "deliver", wraps=core.deliver) as deliver:
+        index = target.linker.start_layer_wise_loading()
+        assert target.wait_loads(1) == [["same-rid", "other"]]
+        batch_ids = {call.kwargs["request_id"] for call in deliver.call_args_list}
+    assert len(batch_ids) == 1 and batch_ids.isdisjoint({original_id, *new_originals})
+    assert batch_ids.isdisjoint(old_batch_ids)
+    assert not core._core._remote_fw_dram._request_hints
+    target.linker.layer_done_counter.set_consumer(index)
+    target.linker.layer_done_counter.wait_until(LAYERS - 1)
+    for first_page in (8, 16):
+        for name, layers in target.snapshot(first_page, 1).items():
+            assert all(
+                torch.equal(got, ref) for got, ref in zip(layers, expected[name])
+            )
 
 
 def test_telemetry_summaries_are_cumulative_bounded_and_thread_safe():

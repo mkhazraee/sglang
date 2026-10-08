@@ -27,10 +27,12 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     local_dram_bytes_per_worker: int
     pin_local_dram: bool = True
     nixl_backend: str = "UCX"
-    # False keeps the same transfers but releases compute after the entire load.
+    # Staged restore only: False releases compute after the entire load.
+    # Unleased direct reads always complete before radix-tree publication.
     progressive_restore: bool = True
     eviction_policy: str = "lru"
     # Experimental: query does not reserve peer objects until delivery starts.
+    # Reads finish into private HBM before admission; a drained miss recomputes.
     direct_remote_restore: bool = False
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.

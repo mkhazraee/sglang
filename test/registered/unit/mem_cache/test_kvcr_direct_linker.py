@@ -493,7 +493,12 @@ class Harness:
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             )
-        assert self.linker.load(rid, transfers)
+        # Low-level batch tests use private fake tensors, never published cache
+        # slots. Exercise the queued builder explicitly; integration tests below
+        # call load_before_commit and verify the public direct-load guard.
+        assert self.linker.load(
+            rid, transfers, _precommit=self.linker.requires_precommit_load
+        )
         return self.linker.start_layer_wise_loading() if start else -1
 
     def wait_loads(self, count: int) -> list[list[str]]:
@@ -2293,7 +2298,7 @@ def test_direct_remote_batch_routes_merge_same_peer_and_hold_union_hint(
 
 
 @pytest.mark.parametrize("evict_source", [False, True])
-def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_source):
+def test_direct_precommit_uses_peer_bytes_and_retains_hints(harness, evict_source):
     from kvcr.types import QueryStatus
 
     network = FakePeerNetwork()
@@ -2321,7 +2326,11 @@ def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_sou
     core = target.linker._kvcr
     hints = core._core._remote_fw_dram._request_hints
     keys = [target.linker._key(page, str(PoolName.KV)) for page in hashes]
-
+    transfers = [
+        PoolTransfer(
+            name=PoolName.KV, keys=hashes, device_indices=target.page_indices(4, 1)
+        )
+    ]
     with patch.object(core, "fetch", wraps=core.fetch) as fetch:
         unused = target.prepare("unused", hashes, hint=source.hint(hashes))
         target.wait_ready(unused)
@@ -2329,16 +2338,13 @@ def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_sou
         assert unused_id in hints
         target.linker.release_request("unused")
         target.wait(lambda: unused_id not in hints)
-
         handle = target.prepare("peer", hashes, hint=source.hint(hashes))
         target.wait_ready(handle)
         request_id = target.linker._preparations[handle].request_id
         assert target.linker.lookup("peer", target.lookup_transfers(hashes)) == [1]
-        fetch.assert_not_called()
+        assert target.linker.requires_precommit_load
+        assert not target.linker.loaded_pages_are_stored
         assert target.public_claims() == 0 and target.agent.xfers == []
-        assert core.query(keys) == [(QueryStatus.MISS, None)]
-        assert request_id in hints
-
         if evict_source:
             source.fill(1, 1, seed=30)
             source.offload(_hashes("replacement", 1), first_page=1)
@@ -2346,84 +2352,111 @@ def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_sou
             assert source.linker._kvcr.query(keys) == [(QueryStatus.MISS, None)]
         else:
             source.agent.default_state = "PROC"
-        first = len(source.agent.xfers) + 1
-        try:
-            index = target.load("peer", hashes, first_page=4)
-            futures = target.linker.layer_done_counter.futures[index]
-            if not evict_source:
-                source.wait(lambda: len(source.agent.xfers) == first + LAYERS - 1)
-                layer_zero_address = target.buffers["k"][0][4 * PAGE].data_ptr()
-                first_layer = next(
-                    number
-                    for number in range(first, first + LAYERS)
-                    if any(
-                        address == layer_zero_address
-                        for address, _, _ in source.agent.xfers[number - 1][2]
+        first = len(source.agent.xfers)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            done = executor.submit(target.linker.load_before_commit, "peer", transfers)
+            try:
+                if not evict_source:
+                    source.wait(lambda: len(source.agent.xfers) == first + LAYERS)
+                    # Completing layer zero must not publish the request or
+                    # release compute while later layers still target private HBM.
+                    layer_zero_address = target.buffers["k"][0][4 * PAGE].data_ptr()
+                    first_layer = next(
+                        number
+                        for number in range(first + 1, first + LAYERS + 1)
+                        if any(
+                            address == layer_zero_address
+                            for address, _, _ in source.agent.xfers[number - 1][2]
+                        )
                     )
-                )
-                source.agent.states[first_layer] = "DONE"
-                target.wait(lambda: futures[0].done())
-                assert futures[0].exception() is None
-                assert not futures[1].done() and not futures[2].done()
-                for name, layers in target.snapshot(4, 1).items():
-                    assert torch.equal(layers[0], expected[name][0])
-                    assert not torch.count_nonzero(layers[1])
-                    assert not torch.count_nonzero(layers[2])
-                assert target.linker.num_completed_loads() == 0
-                assert request_id in hints
+                    source.agent.states[first_layer] = "DONE"
+                    source.wait(lambda: first_layer in source.agent.released)
+                    target.wait(lambda: target.linker._adapter.pending_ops == LAYERS - 1)
+                    assert not done.done()
+                    assert request_id in hints
+                    assert target.linker.layer_done_counter.producer_index == -1
+            finally:
                 source.agent.default_state = "DONE"
-            assert target.wait_loads(1) == [["peer"]]
-            target.wait(lambda: request_id not in hints)
-            fetch.assert_not_called()
-            assert target.public_claims() == 0 and target.agent.xfers == []
-            assert core.query(keys) == [(QueryStatus.MISS, None)]
-            target.linker.layer_done_counter.set_consumer(index)
-            if evict_source:
-                with pytest.raises(RuntimeError, match="layer-wise KV load failed"):
-                    target.linker.layer_done_counter.wait_until(LAYERS - 1)
-                assert target.linker._unhealthy is not None
+            assert done.result(timeout=TIMEOUT_S) is not evict_source
+        target.wait(lambda: request_id not in hints)
+        fetch.assert_not_called()
+        assert target.public_claims() == 0 and target.agent.xfers == []
+        assert core.query(keys) == [(QueryStatus.MISS, None)]
+        assert target.linker.num_completed_loads() == 0
+        assert target.linker.start_layer_wise_loading() == -1
+        assert target.linker._active_load_batches == 0
+        assert target.linker._unhealthy is None
+        if evict_source:
+            assert target.linker.snapshot_stats()["precommit_misses"] == 1
+            assert all(
+                not torch.count_nonzero(layer)
+                for layers in target.snapshot(4, 1).values()
+                for layer in layers
+            )
+        else:
+            for name, layers in target.snapshot(4, 1).items():
                 assert all(
-                    not torch.count_nonzero(layer)
-                    for layers in target.snapshot(4, 1).values()
-                    for layer in layers
+                    torch.equal(got, want) for got, want in zip(layers, expected[name])
                 )
-            else:
-                target.linker.layer_done_counter.wait_until(LAYERS - 1)
-                for name, layers in target.snapshot(4, 1).items():
-                    assert all(
-                        torch.equal(got, want)
-                        for got, want in zip(layers, expected[name])
+            # A restored page can become this worker's DRAM source only after
+            # its own offload. Exercise another peer restore from that copy.
+            target.offload(hashes, first_page=4)
+            assert target.wait_offloads(1) == [True]
+            third = harness(network=network, extra={"direct_remote_restore": True})
+            third.wait_ready(third.prepare("relay", hashes, hint=target.hint(hashes)))
+            assert third.linker.load_before_commit(
+                "relay",
+                [
+                    PoolTransfer(
+                        name=PoolName.KV,
+                        keys=hashes,
+                        device_indices=third.page_indices(4, 1),
                     )
-                source.wait(
-                    lambda: (
-                        source.linker._kvcr._core._block_record_map[
-                            keys[0]
-                        ].local_dram.claim_count
-                        == 0
-                    )
+                ],
+            )
+            for name, layers in third.snapshot(4, 1).items():
+                assert all(
+                    torch.equal(got, want) for got, want in zip(layers, expected[name])
                 )
-                # A peer-to-device restore must remain eligible for local offload
-                # so this worker can serve the same prefix to the next worker.
-                assert not target.linker.loaded_pages_are_stored
-                target.offload(hashes, first_page=4)
-                assert target.wait_offloads(1) == [True]
-                relay = harness(network=network, extra={"direct_remote_restore": True})
-                handle = relay.prepare("relay", hashes, hint=target.hint(hashes))
-                relay.wait_ready(handle)
-                assert relay.linker.lookup("relay", relay.lookup_transfers(hashes)) == [
-                    1
-                ]
-                index = relay.load("relay", hashes, first_page=0)
-                assert relay.wait_loads(1) == [["relay"]]
-                relay.linker.layer_done_counter.set_consumer(index)
-                relay.linker.layer_done_counter.wait_until(LAYERS - 1)
-                for name, layers in relay.snapshot(0, 1).items():
-                    assert all(
-                        torch.equal(got, want)
-                        for got, want in zip(layers, expected[name])
-                    )
-        finally:
-            source.agent.default_state = "DONE"
+
+
+def test_direct_read_cannot_queue_into_published_slots(harness):
+    h = harness(extra={"direct_remote_restore": True})
+    with pytest.raises(RuntimeError, match="load_before_commit"):
+        h.linker.load("unreserved", [])
+
+
+def test_direct_precommit_restores_full_prefix_and_trailing_pool(harness):
+    h = harness(with_swa=True, extra={"direct_remote_restore": True})
+    hashes = _hashes("precommit-multiple-pools", 4)
+    h.fill(0, 4, seed=95)
+    expected = h.snapshot(0, 4)
+    h.offload(hashes, first_page=0, swa_tail=2)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("hybrid", hashes, swa_window=2))
+    assert h.linker.lookup("hybrid", h.lookup_transfers(hashes, swa_window=2)) == [4]
+    assert h.linker.load_before_commit(
+        "hybrid",
+        [
+            PoolTransfer(
+                name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 4)
+            ),
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=hashes[-2:],
+                device_indices=h.page_indices(10, 2),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+        ],
+    )
+    restored = h.snapshot(8, 4)
+    for name in ("k", "v"):
+        for got, want in zip(restored[name], expected[name]):
+            assert torch.equal(got, want)
+    assert torch.equal(restored["swa"][0][-2 * PAGE :], expected["swa"][0][-2 * PAGE :])
+    assert not torch.count_nonzero(restored["swa"][0][: 2 * PAGE])
+    assert h.linker.num_completed_loads() == 0
+    assert h.public_claims() == 0
 
 
 @pytest.mark.parametrize("install_before_error", [False, True])
@@ -2601,6 +2634,167 @@ def test_direct_remote_reset_releases_queued_hints_and_uses_fresh_batch_id(harne
             )
 
 
+@pytest.mark.parametrize("failure", ["submission", "entry", "uncertain"])
+def test_precommit_failures_do_not_recycle_active_destinations(harness, failure):
+    from kvcr.types import TransferError
+
+    h = harness(
+        extra={
+            "direct_remote_restore": True,
+            "fetch_chunk_pages": 1,
+            "max_inflight_restore_ops": 2,
+            "operation_timeout_ms": 1000,
+            "abandon_timeout_ms": 2000,
+        }
+    )
+    hashes = _hashes("precommit-drain", 3)
+    h.fill(0, 3, seed=94)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("read", hashes))
+    transfers = [
+        PoolTransfer(name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 3))
+    ]
+    first = len(h.agent.xfers) + 1
+    h.agent.default_state = "PROC"
+    deliver = h.linker._kvcr.deliver
+    calls = 0
+
+    def maybe_fail(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if failure == "submission" and calls == 2:
+            raise RuntimeError("injected submission failure")
+        return deliver(*args, **kwargs)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with patch.object(h.linker._kvcr, "deliver", side_effect=maybe_fail):
+            done = executor.submit(h.linker.load_before_commit, "read", transfers)
+            try:
+                h.wait(lambda: len(h.agent.xfers) >= first)
+                if failure == "entry":
+                    h.agent.states[first] = "ERR"
+                    h.wait(lambda: first in h.agent.released)
+                elif failure == "uncertain":
+                    h.linker._on_resilience_event(
+                        TransferError("test", 100, state="uncertain")
+                    )
+                    with pytest.raises(RuntimeError, match="slots must stay owned"):
+                        done.result(timeout=TIMEOUT_S)
+                if failure in ("entry", "submission"):
+                    assert not done.done()
+                assert h.linker.num_completed_loads() == 0
+                assert h.linker._active_load_batches == 1
+            finally:
+                h.agent.default_state = "DONE"
+            if failure in ("submission", "uncertain"):
+                with pytest.raises(RuntimeError):
+                    done.result(timeout=TIMEOUT_S)
+            else:
+                assert done.result(timeout=TIMEOUT_S) is False
+    h.wait(lambda: h.linker._active_load_batches == 0)
+    assert h.linker._adapter.pending_ops == 0
+
+
+def test_precommit_stalled_producer_event_fails_without_releasing_destinations(harness):
+    from threading import Event
+
+    h = harness(
+        extra={
+            "direct_remote_restore": True,
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+        }
+    )
+    hashes = _hashes("precommit-stalled-producer", 1)
+    h.fill(0, 1, seed=99)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("stalled", hashes))
+    transfers = [
+        PoolTransfer(
+            name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 1)
+        )
+    ]
+    before = len(h.agent.xfers)
+    producer_ready = Event()
+    # Only the startup wait is shortened; already-constructed KVCR operations
+    # retain their ordinary deadline after the fake CUDA producer is released.
+    startup_config = linker_module.msgspec.structs.replace(
+        h.linker.config, operation_timeout_ms=20
+    )
+    with (
+        patch.object(h.linker, "config", startup_config),
+        patch.object(
+            linker_module,
+            "_ready_event",
+            return_value=SimpleNamespace(query=producer_ready.is_set),
+        ),
+    ):
+        try:
+            with pytest.raises(RuntimeError, match="slots must stay owned"):
+                h.linker.load_before_commit("stalled", transfers)
+            assert len(h.agent.xfers) == before
+            assert h.linker._active_load_batches == 1
+            assert h.linker.num_completed_loads() == 0
+            assert h.linker.layer_done_counter.producer_index == -1
+        finally:
+            # The caller kept the fake destination alive. Let deferred work
+            # drain before harness teardown; the timeout is not cancellation.
+            producer_ready.set()
+    h.wait(lambda: h.linker._active_load_batches == 0)
+    assert h.linker._adapter.pending_ops == 0
+    assert h.linker.num_completed_loads() == 0
+
+
+def test_precommit_waits_for_progressing_windows_past_one_operation_deadline(harness):
+    # A whole-request deadline would fail after 2s even though every operation
+    # below completes in about 300ms, safely within its own 2s core deadline.
+    h = harness(
+        extra={
+            "direct_remote_restore": True,
+            "fetch_chunk_pages": 1,
+            "max_inflight_restore_ops": 1,
+            "operation_timeout_ms": 2000,
+            "abandon_timeout_ms": 4000,
+        }
+    )
+    hashes = _hashes("progressing-precommit", 3)
+    h.fill(0, 3, seed=97)
+    expected = h.snapshot(0, 3)
+    h.offload(hashes, first_page=0)
+    assert h.wait_offloads(1) == [True]
+    h.wait_ready(h.prepare("progressing", hashes))
+    transfers = [
+        PoolTransfer(
+            name=PoolName.KV, keys=hashes, device_indices=h.page_indices(8, 3)
+        )
+    ]
+    first = len(h.agent.xfers) + 1
+    h.agent.default_state = "PROC"
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        done = executor.submit(h.linker.load_before_commit, "progressing", transfers)
+        try:
+            # Three pages, one page per operation, three layers: nine windows.
+            for handle in range(first, first + 9):
+                h.wait(lambda: len(h.agent.xfers) >= handle)
+                time.sleep(0.3)
+                assert not done.done(), "restore ended before all accepted copies drained"
+                h.agent.states[handle] = "DONE"
+            assert done.result(timeout=TIMEOUT_S) is True
+        finally:
+            h.agent.default_state = "DONE"
+    assert time.monotonic() - started > 2
+    assert h.linker.snapshot_stats()["precommit_operations"] == 9
+    assert h.linker._active_load_batches == 0
+    assert h.linker._adapter.pending_ops == 0
+    assert h.linker.num_completed_loads() == 0
+    assert h.linker.layer_done_counter.producer_index == -1
+    for name, layers in h.snapshot(8, 3).items():
+        assert all(torch.equal(got, want) for got, want in zip(layers, expected[name]))
+
+
 def test_telemetry_summaries_are_cumulative_bounded_and_thread_safe():
     from kvcr import DURATION_METRIC, STATE_METRIC, TRANSFER_BYTES_METRIC
 
@@ -2650,8 +2844,20 @@ def test_telemetry_records_real_nixl_path_and_once_only_timings(
     h.wait_ready(handle)
     for _ in range(3):
         assert h.linker.preparation_ready(handle)
-    h.load("telemetry", hashes, first_page=4)
-    assert h.wait_loads(1) == [["telemetry"]]
+    if direct_remote:
+        assert h.linker.load_before_commit(
+            "telemetry",
+            [
+                PoolTransfer(
+                    name=PoolName.KV, keys=hashes, device_indices=h.page_indices(4, 2)
+                )
+            ],
+        )
+        assert h.linker.num_completed_loads() == 0
+        assert h.linker.layer_done_counter.producer_index == -1
+    else:
+        h.load("telemetry", hashes, first_page=4)
+        assert h.wait_loads(1) == [["telemetry"]]
     h.wait(lambda: h.public_claims() == 0)
     snapshot = h.linker.snapshot_stats()
     if not enabled:
@@ -2739,6 +2945,7 @@ def test_layer_telemetry_waits_for_all_chunks_independently_of_release_mode(
                     device_indices=h.page_indices(destination, 4),
                 )
             ],
+            _precommit=direct_remote,
         )
     first = len(h.agent.xfers) + 1
     h.agent.default_state = "PROC"

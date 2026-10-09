@@ -11,9 +11,10 @@ Ownership model
   ``fetch`` for useful candidates, which acquires residency claims; ``lookup``
   then exposes only pages whose claims are held. Claims live until the page is
   delivered to the GPU (or the request is released), so a lookup result cannot
-  be evicted underneath the load. Opt-in direct remote restore admits query
-  candidates without a lease and retains their hints for peer-to-GPU delivery;
-  eviction after admission fails the load rather than exposing uncertain bytes.
+  be evicted underneath the load. Opt-in direct remote restore treats query
+  results as unleased candidates and retains their hints for peer-to-GPU
+  delivery into private slots. Only completed reads become published hits;
+  a safely drained source miss falls back to recomputation.
 """
 
 from __future__ import annotations
@@ -337,6 +338,8 @@ class _LoadBatch:
         "error",
         "requested_at",
         "copy_started_at",
+        "precommit_done",
+        "first_operation_submitted",
     )
 
     def __init__(
@@ -357,6 +360,8 @@ class _LoadBatch:
             default=None,
         )
         self.copy_started_at: Optional[float] = None
+        self.precommit_done: Optional[threading.Event] = None
+        self.first_operation_submitted = False
 
 
 class _OffloadTask:
@@ -462,7 +467,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.config = KVCRLinkerConfig.from_extra_config(extra_config)
+        self.requires_precommit_load = self.config.direct_remote_restore
         self.loaded_pages_are_stored = not self.config.direct_remote_restore
+        self._uncertain_transfer_error: Optional[BaseException] = None
         self.page_size = params.page_size
         self._params = params
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -544,6 +551,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._kvcr = self._build_kvcr()
         self._adapter = self._start_adapter(self._kvcr)
         self._log_startup()
+        if self.requires_precommit_load:
+            logger.warning(
+                "KVCR direct reads complete before radix-tree publication; "
+                "progressive_restore does not release layers before this gate. "
+                "Restored HBM remains eligible for local DRAM offload."
+            )
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -1258,7 +1271,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     # Load: claims -> deliver into adopted GPU indices
     # ------------------------------------------------------------------
 
-    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+    def load(
+        self, rid: str, transfers: list[PoolTransfer], *, _precommit: bool = False
+    ) -> bool:
+        if self.requires_precommit_load and not _precommit:
+            raise RuntimeError("Direct KVCR reads require load_before_commit.")
         expanded = self.pool_group.resolve_transfers(
             transfers, allow_partial=True, allow_missing_kv=True
         )
@@ -1320,6 +1337,52 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 (len(pool.page_hashes) for pool in pools), default=0
             )
         return True
+
+    def load_before_commit(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Confirm unleased reads into private HBM before publishing any hit."""
+        assert self.requires_precommit_load
+        self._check_precommit_health()
+        if not self.load(rid, transfers, _precommit=True):
+            return False
+        with self._lock:
+            pools = self._pending_loads.pop(rid)
+            self.stats["load_batches"] += 1
+            self.stats["precommit_loads"] += 1
+            self._active_load_batches += 1
+        batch = _LoadBatch(-1, [rid], pools, _ready_event())
+        batch.precommit_done = threading.Event()
+        batch.bytes = sum(
+            len(pool.page_hashes) * self.layouts[pool.pool].object_bytes
+            for pool in pools
+        )
+        start_deadline = time.monotonic() + self.config.operation_timeout_ms / 1000.0
+        self._adapter.post(
+            lambda adapter: self._defer(
+                batch.ready_event, lambda: self._submit_load(batch)
+            )
+        )
+        # KVCR times out each accepted operation; a whole-restore deadline would
+        # reject healthy multi-window loads while their earlier reads still drain.
+        while not batch.precommit_done.wait(timeout=0.01):
+            self._check_precommit_health()
+            # Before the first delivery, no KVCR operation deadline exists yet.
+            if not batch.first_operation_submitted and time.monotonic() >= start_deadline:
+                raise RuntimeError(
+                    "KVCR precommit read did not start; device slots must stay owned"
+                )
+        self._check_precommit_health()
+        if batch.error is not None:
+            raise RuntimeError("KVCR precommit submission failed") from batch.error
+        return batch.success
+
+    def _check_precommit_health(self) -> None:
+        self._adapter.raise_if_failed()
+        if not self._adapter.healthy:
+            raise RuntimeError("KVCR owner stopped; device slots must stay owned")
+        if self._uncertain_transfer_error is not None:
+            raise RuntimeError(
+                "KVCR precommit DMA is uncertain; device slots must stay owned"
+            ) from self._uncertain_transfer_error
 
     def cancel_queued_load(self, rid: str) -> bool:
         # The tree already published the destination indices; dropping the
@@ -1458,12 +1521,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 if not operations:
                     # A shared span belongs to its earliest consumer. The
                     # sequential forward pass waits there before later layers.
-                    if self.config.progressive_restore:
+                    if (
+                        self.config.progressive_restore
+                        and batch.precommit_done is None
+                    ):
                         self.layer_done_counter.complete(batch.counter_index, layer)
                     continue
                 batch.layer_outstanding[layer] = len(operations)
                 for request_id, blocks in operations:
                     batch.operations.append((layer, request_id, blocks))
+            if batch.precommit_done is not None:
+                with self._lock:
+                    self.stats["precommit_operations"] += len(batch.operations)
         except Exception as error:
             batch.success = False
             batch.error = error
@@ -1503,6 +1572,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 ):
                     layer, request_id, blocks = batch.operations.popleft()
                     op = self._adapter.kvcr.deliver(blocks, request_id=request_id)
+                    batch.first_operation_submitted = True
                     batch.outstanding += 1
                     self._adapter.track(
                         op, self._load_completion(batch, layer, tuple(blocks))
@@ -1534,7 +1604,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 self._record_timing(
                     "restore_layer_completion", batch.copy_started_at, (str(layer),)
                 )
-                if self.config.progressive_restore:
+                if self.config.progressive_restore and batch.precommit_done is None:
                     self.layer_done_counter.complete(batch.counter_index, layer)
             self._refill_load(batch)
 
@@ -1550,12 +1620,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._discard_hint(request_id)
         claims = [claim for pool in batch.pools for claim in pool.claims]
         if batch.success and error is None:
-            self.layer_done_counter.complete_all(batch.counter_index)
+            if batch.precommit_done is None:
+                self.layer_done_counter.complete_all(batch.counter_index)
             with self._lock:
                 self.stats["restored_pages"] += max(
                     (len(pool.page_hashes) for pool in batch.pools), default=0
                 )
                 self.stats["gpu_restore_bytes"] += batch.bytes
+        elif batch.precommit_done is not None:
+            # Accepted reads have drained; an ordinary miss can free private slots.
+            # Submission errors and uncertain DMA still raise at the gate.
+            batch.error = batch.error or error
+            with self._lock:
+                self.stats["precommit_misses"] += 1
         else:
             # After admission a failed transfer is not a miss: the tree already
             # exposes the destination slots. Fail the counter so the worker stops
@@ -1570,8 +1647,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             )
         self._release_handles(claims)
         with self._lock:
-            self._completed_loads.append(batch.rids)
+            if batch.precommit_done is None:
+                self._completed_loads.append(batch.rids)
             self._active_load_batches -= 1
+        if batch.precommit_done is not None:
+            batch.precommit_done.set()
 
     # ------------------------------------------------------------------
     # Offload: GPU pages -> KVCR DRAM through deposit
@@ -1747,6 +1827,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _on_resilience_event(self, error: Exception) -> None:
         with self._lock:
             self.stats["resilience_events"] += 1
+            if getattr(error, "state", None) == "uncertain":
+                self._uncertain_transfer_error = error
         logger.warning("KVCR resilience event: %s", error)
 
     def _on_unhealthy(self, error: BaseException) -> None:
@@ -1897,6 +1979,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         with self._lock:
             self._generation += 1
             self._unhealthy = None
+            self._uncertain_transfer_error = None
             self._abandoned_bytes = 0
             self._deferred = []
             self.stats["resets"] += 1

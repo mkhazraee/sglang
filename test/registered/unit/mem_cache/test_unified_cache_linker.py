@@ -1404,6 +1404,164 @@ def test_linker_load_preserves_swa_boundaries(
         assert len(backend.queued_offloads) == 2
 
 
+@pytest.mark.parametrize(
+    "local_hit,other_rank_hit", [(True, True), (False, True), (True, False)]
+)
+def test_precommit_load_confirms_every_rank_before_publishing(
+    full_linker_component, local_hit, other_rank_hit
+):
+    full = full_linker_component
+    full.update_external_linker_load = MagicMock(
+        side_effect=lambda *args, **kw: args[3]
+    )
+    indices = torch.arange(4, dtype=torch.int64)
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        page_size=2,
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=indices[:0]),
+            collect_full_device_indices=lambda node, ancestor: indices,
+            mark_external_cache_stored_path=MagicMock(),
+        ),
+        insert=MagicMock(
+            return_value=InsertResult(
+                prefix_len=4,
+                total_len=4,
+                last_device_node=1,
+                adopted_ranges={ComponentType.FULL: [(0, 4)]},
+            )
+        ),
+        _all_reduce_attn_groups=MagicMock(side_effect=[None, None]),
+    )
+    backend = _FakeLinker()
+    backend.requires_precommit_load = True
+    backend.loaded_pages_are_stored = False
+    backend.release_request = MagicMock()
+
+    def copy_before_publication(rid, transfers):
+        cache.insert.assert_not_called()
+        full.update_external_linker_load.assert_not_called()
+        assert transfers[0].device_indices.tolist() == indices.tolist()
+        return local_hit
+
+    backend.load_before_commit = copy_before_publication
+    reductions = 0
+
+    def reduce_success(value, op):
+        nonlocal reductions
+        reductions += 1
+        if reductions == 2:
+            value.fill_(int(local_hit and other_rank_hit))
+
+    cache._all_reduce_attn_groups = reduce_success
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        prefix_key=RadixKey(array("q", [1, 2, 3, 4])),
+        tail_hashes=["a", "b"],
+        device_hit_len=0,
+    )
+    req = SimpleNamespace(
+        rid="rid", kv=None, prefix_indices=indices[:0], last_node=0, priority=0
+    )
+    restored, node = wrapper.load_back(req)
+    assert not backend.queued_loads
+    assert not wrapper.pending_loads
+    # Reading a peer's DRAM does not create a local DRAM copy. Keep the path
+    # eligible for normal write-through, rather than suppressing future offload.
+    cache.tree_core.mark_external_cache_stored_path.assert_not_called()
+    phases = [call.args[0] for call in full.update_external_linker_load.call_args_list]
+    if local_hit and other_rank_hit:
+        assert restored.tolist() == indices.tolist() and node == 1
+        cache.insert.assert_called_once()
+        assert phases == [
+            ExternalLinkerLoadPhase.PREPARE,
+            ExternalLinkerLoadPhase.COMMIT,
+        ]
+        backend.release_request.assert_not_called()
+    else:
+        assert restored.numel() == 0 and node == 0
+        cache.insert.assert_not_called()
+        assert phases == [ExternalLinkerLoadPhase.ABORT]
+        backend.release_request.assert_called_once_with("rid")
+
+
+def test_precommit_uncertain_read_never_frees_or_publishes_slots(full_linker_component):
+    full = full_linker_component
+    full.update_external_linker_load = MagicMock()
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        page_size=2,
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=torch.empty(0))
+        ),
+        insert=MagicMock(),
+        _all_reduce_attn_groups=lambda value, op: None,
+    )
+    backend = _FakeLinker()
+    backend.requires_precommit_load = True
+    backend.release_request = MagicMock()
+    backend.load_before_commit = MagicMock(side_effect=RuntimeError("uncertain DMA"))
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        prefix_key=RadixKey(array("q", [1, 2])),
+        tail_hashes=["a"],
+        device_hit_len=0,
+    )
+    req = SimpleNamespace(rid="rid", last_node=0)
+    with pytest.raises(RuntimeError, match="uncertain DMA"):
+        wrapper.load_back(req)
+    backend.release_request.assert_not_called()
+    cache.insert.assert_not_called()
+    full.update_external_linker_load.assert_not_called()
+
+
+@pytest.mark.parametrize("local_allocation", [True, False])
+def test_precommit_allocation_failure_is_collective(
+    full_linker_component, local_allocation
+):
+    full = full_linker_component
+    full.update_external_linker_load = MagicMock()
+    if not local_allocation:
+        full.build_external_linker_transfer.return_value = None
+        full.build_external_linker_transfer.side_effect = None
+    reduce = MagicMock(side_effect=lambda value, op: value.fill_(0))
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        page_size=2,
+        tree_core=SimpleNamespace(
+            empty_match_result=SimpleNamespace(device_indices=torch.empty(0))
+        ),
+        _all_reduce_attn_groups=reduce,
+        insert=MagicMock(),
+    )
+    backend = _FakeLinker()
+    backend.requires_precommit_load = True
+    backend.load_before_commit = MagicMock()
+    backend.release_request = MagicMock()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
+        prefix_key=RadixKey(array("q", [1, 2])),
+        tail_hashes=["a"],
+        device_hit_len=0,
+    )
+    restored, node = wrapper.load_back(SimpleNamespace(rid="rid", last_node=0))
+    assert restored.numel() == 0 and node == 0
+    reduce.assert_called_once()
+    backend.load_before_commit.assert_not_called()
+    backend.release_request.assert_called_once_with("rid")
+    cache.insert.assert_not_called()
+    if local_allocation:
+        assert (
+            full.update_external_linker_load.call_args.args[0]
+            == ExternalLinkerLoadPhase.ABORT
+        )
+    else:
+        full.update_external_linker_load.assert_not_called()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

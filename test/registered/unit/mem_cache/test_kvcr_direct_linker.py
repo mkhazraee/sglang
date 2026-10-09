@@ -277,6 +277,7 @@ def _publish_args(extra: dict) -> None:
     config = {
         "local_dram_bytes_per_worker": 1 << 20,
         "pin_local_dram": False,
+        "direct_remote_restore": False,
         "preparation_deadline_ms": 2000,
         "operation_timeout_ms": 500,
         "abandon_timeout_ms": 1000,
@@ -621,6 +622,7 @@ def test_offload_prepare_lookup_load_round_trip_moves_bytes(harness):
     from kvcr.types import RegionDescriptor
 
     h = harness()
+    assert h.linker.loaded_pages_are_stored
     regions = h.linker._framework_regions
     assert len(regions) == 2 * LAYERS
     assert all(isinstance(region, RegionDescriptor) for region in regions)
@@ -736,7 +738,11 @@ def test_mamba_restore_copies_checkpoint_and_gates_cow_until_all_spans_land(
     h = harness(
         device_pools=(group, buffers),
         req_to_token_pool=req_pool,
-        extra={"operation_timeout_ms": 5000, "abandon_timeout_ms": 10000},
+        extra={
+            "operation_timeout_ms": 5000,
+            "abandon_timeout_ms": 10000,
+            "max_inflight_restore_ops": 8,
+        },
     )
     hashes = _hashes("mamba-restore", 2)
     h.fill(0, 2, seed=41)
@@ -1258,18 +1264,30 @@ def test_hint_parser_reads_kv_fetch_and_ignores_unknown_actions():
 
 
 def test_config_rejects_unknown_and_unsafe_options():
-    assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).eviction_policy == "lru"
-    assert KVCRLinkerConfig(local_dram_bytes_per_worker=1).max_inflight_restore_ops == 8
+    config = KVCRLinkerConfig.from_extra_config({"local_dram_bytes_per_worker": 1})
     assert (
-        KVCRLinkerConfig(local_dram_bytes_per_worker=1).max_cached_descriptor_pages
-        == 4096
+        config.direct_remote_restore,
+        config.progressive_restore,
+        config.fetch_chunk_pages,
+        config.max_inflight_restore_ops,
+    ) == (True, True, 2048, 4)
+    assert config.eviction_policy == "lru"
+    assert config.max_cached_descriptor_pages == 4096
+    config = KVCRLinkerConfig.from_extra_config(
+        {
+            "local_dram_bytes_per_worker": 1,
+            "direct_remote_restore": False,
+            "progressive_restore": False,
+            "fetch_chunk_pages": 32,
+            "max_inflight_restore_ops": 2,
+        }
     )
     assert (
-        KVCRLinkerConfig.from_extra_config(
-            {"local_dram_bytes_per_worker": 1, "max_inflight_restore_ops": 2}
-        ).max_inflight_restore_ops
-        == 2
-    )
+        config.direct_remote_restore,
+        config.progressive_restore,
+        config.fetch_chunk_pages,
+        config.max_inflight_restore_ops,
+    ) == (False, False, 32, 2)
     for limit in (0, -1, True, 1.5):
         with pytest.raises(ValueError, match="max_inflight_restore_ops"):
             KVCRLinkerConfig.from_extra_config(
@@ -2023,6 +2041,7 @@ def test_abandoned_bytes_count_only_pending_fetches(
     owner = KVCRDirectLinker.__new__(KVCRDirectLinker)
     owner.config = KVCRLinkerConfig(
         local_dram_bytes_per_worker=64,
+        direct_remote_restore=False,
         fetch_chunk_pages=1,
         max_abandoned_bytes=8,
     )
@@ -2383,6 +2402,26 @@ def test_direct_remote_layers_use_peer_bytes_and_retain_hints(harness, evict_sou
                         == 0
                     )
                 )
+                # A peer-to-device restore must remain eligible for local offload
+                # so this worker can serve the same prefix to the next worker.
+                assert not target.linker.loaded_pages_are_stored
+                target.offload(hashes, first_page=4)
+                assert target.wait_offloads(1) == [True]
+                relay = harness(network=network, extra={"direct_remote_restore": True})
+                handle = relay.prepare("relay", hashes, hint=target.hint(hashes))
+                relay.wait_ready(handle)
+                assert relay.linker.lookup("relay", relay.lookup_transfers(hashes)) == [
+                    1
+                ]
+                index = relay.load("relay", hashes, first_page=0)
+                assert relay.wait_loads(1) == [["relay"]]
+                relay.linker.layer_done_counter.set_consumer(index)
+                relay.linker.layer_done_counter.wait_until(LAYERS - 1)
+                for name, layers in relay.snapshot(0, 1).items():
+                    assert all(
+                        torch.equal(got, want)
+                        for got, want in zip(layers, expected[name])
+                    )
         finally:
             source.agent.default_state = "DONE"
 

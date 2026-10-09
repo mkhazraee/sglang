@@ -82,6 +82,8 @@ class UnifiedCacheLinker(ABC):
     # Whether offload commits publish EXTERNAL-tier KV events and evictions
     # withdraw them; only a backend that reports evictions may set this.
     publishes_external_events: bool = False
+    # False keeps restored pages eligible for offload into this worker's store.
+    loaded_pages_are_stored: bool = True
 
     def prepare_request(
         self, context: LinkerRequestContext, transfers: list[PoolTransfer]
@@ -479,9 +481,10 @@ class UnifiedCacheLinkerWrapper:
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        cache.tree_core.mark_external_cache_stored_path(
-            insert_result.last_device_node, req.last_node
-        )
+        if self.cache_linker.loaded_pages_are_stored:
+            cache.tree_core.mark_external_cache_stored_path(
+                insert_result.last_device_node, req.last_node
+            )
         return canonical_tail, insert_result.last_device_node
 
     def _queue_load(
@@ -598,7 +601,17 @@ class UnifiedCacheLinkerWrapper:
 
     def offload_nodes(self, node_ids: Sequence[NodeId]) -> None:
         """Persist a write-through chain, skipping nodes already in the store."""
+        restoring_nodes = set()
+        if not self.cache_linker.loaded_pages_are_stored:
+            for node_id, _ in self.pending_loads.values():
+                node = self.cache.tree_core.node_by_id(node_id)
+                while node is not None and node.id not in restoring_nodes:
+                    restoring_nodes.add(node.id)
+                    node = node.parent
         for node_id in node_ids:
+            # Include split ancestors; retry after restore on a later cache touch.
+            if node_id in restoring_nodes:
+                continue
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )

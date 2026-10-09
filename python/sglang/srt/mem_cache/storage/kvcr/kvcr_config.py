@@ -31,7 +31,7 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     progressive_restore: bool = True
     eviction_policy: str = "lru"
     # Experimental: query does not reserve peer objects until delivery starts.
-    direct_remote_restore: bool = False
+    direct_remote_restore: bool = True
     # Peer control channel. control_port is a base; each rank adds its
     # engine-global attention rank so colocated ranks never collide.
     control_host: str = "0.0.0.0"
@@ -53,9 +53,9 @@ class KVCRLinkerConfig(msgspec.Struct, frozen=True, kw_only=True):
     max_inflight_prepare_requests: int = 64
     max_inflight_prepare_bytes: int = 8 << 30
     max_prepare_bytes_per_request: int = 2 << 30
-    fetch_chunk_pages: int = 32
+    fetch_chunk_pages: int = 2048
     # Per restore batch, shared across requests, pools, and page chunks.
-    max_inflight_restore_ops: int = 8
+    max_inflight_restore_ops: int = 4
     # Count same-key collisions within restore chunks, not every repeated key.
     enable_restore_collision_diagnostics: bool = False
     # Physical-page descriptor lists retained across transfers; 0 disables reuse.

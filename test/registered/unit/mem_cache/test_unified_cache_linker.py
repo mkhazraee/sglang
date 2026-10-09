@@ -121,6 +121,9 @@ class _FakeExternalTreeCore:
             PoolTransfer(name=PoolName.KV, keys=["page"])
         ]
 
+    def node_by_id(self, node_id):
+        return self.nodes[node_id]
+
     def build_external_linker_offload_transfers(self, node_id):
         node = self.nodes[node_id]
         if node.external_cache_stored or node.write_through_pending_id is not None:
@@ -1255,8 +1258,13 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
     ],
 )
+@pytest.mark.parametrize("loaded_pages_are_stored", [True, False])
 def test_linker_load_preserves_swa_boundaries(
-    full_linker_component, swa_req_ring, previous_boundary, expected_boundary
+    full_linker_component,
+    swa_req_ring,
+    previous_boundary,
+    expected_boundary,
+    loaded_pages_are_stored,
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
@@ -1280,32 +1288,51 @@ def test_linker_load_preserves_swa_boundaries(
     adopted = {ComponentType.FULL: [(0, 4)]}
     if participates:
         adopted[ComponentType.SWA] = [(0, 4)]
+    node = SimpleNamespace(
+        id=1, external_cache_stored=False, write_through_pending_id=None, parent=None
+    )
+    unrelated = SimpleNamespace(
+        id=2, external_cache_stored=False, write_through_pending_id=None, parent=None
+    )
+    core = _FakeExternalTreeCore({node.id: node, unrelated.id: unrelated})
+    core.empty_match_result = SimpleNamespace(
+        device_indices=torch.empty(0, dtype=torch.int64)
+    )
+    core.collect_full_device_indices = lambda node, ancestor: full_indices
+    core.mark_external_cache_stored_path = MagicMock(
+        side_effect=lambda node_id, ancestor: setattr(
+            node, "external_cache_stored", True
+        )
+    )
+    lock_params = object()
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
         token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
-        tree_core=SimpleNamespace(
-            empty_match_result=SimpleNamespace(
-                device_indices=torch.empty(0, dtype=torch.int64)
-            ),
-            collect_full_device_indices=lambda node, ancestor: full_indices,
-            mark_external_cache_stored_path=MagicMock(),
-        ),
+        tree_core=core,
         insert=MagicMock(
             return_value=InsertResult(
-                prefix_len=4, total_len=4, last_device_node=0, adopted_ranges=adopted
+                prefix_len=4,
+                total_len=4,
+                last_device_node=node.id,
+                adopted_ranges=adopted,
             )
         ),
-        resolve_node_handle=lambda node_id: SimpleNamespace(id=0),
+        inc_lock_ref=MagicMock(
+            return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
+        ),
+        dec_lock_ref=MagicMock(),
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    backend = _FakeLinker()
+    if not loaded_pages_are_stored:
+        backend.loaded_pages_are_stored = False
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
         prefix_key=RadixKey(array("q", [1, 2, 3, 4])),
         tail_hashes=["a", "b"],
         device_hit_len=0,
     )
-    wrapper._queue_load = MagicMock()
     kv = (
         None
         if previous_boundary is None
@@ -1324,20 +1351,57 @@ def test_linker_load_preserves_swa_boundaries(
     restored, last_node = wrapper.load_back(req)
 
     assert restored.tolist() == full_indices.tolist()
-    assert last_node == 0
+    assert last_node == node.id
     assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 4)
     assert (
         cache.insert.call_args.args[0].get_evicted_seqlen(ComponentType.SWA)
         == expected_boundary
     )
-    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    assert node.external_cache_stored is loaded_pages_are_stored
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+    assert wrapper.pending_loads == {"rid": (node.id, lock_params)}
+    pending_nodes = [node.id]
+    if not loaded_pages_are_stored:
+        split_parent = SimpleNamespace(
+            id=3,
+            external_cache_stored=False,
+            write_through_pending_id=None,
+            parent=None,
+        )
+        node.parent = split_parent
+        core.nodes[split_parent.id] = split_parent
+        pending_nodes.append(split_parent.id)
+    wrapper.offload_nodes(pending_nodes)
+    assert not backend.queued_offloads
+    wrapper.offload_nodes([unrelated.id])
+    assert len(backend.queued_offloads) == 1
+    assert node.write_through_pending_id is None
+    backend.completed_offloads.append(True)
+    wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+    assert unrelated.external_cache_stored
+    cache.dec_lock_ref.reset_mock()
+    backend.completed_loads.append(["rid"])
+    wrapper.drain_loads(1)
+    assert not wrapper.pending_loads
+    cache.dec_lock_ref.assert_called_once_with(node.id, lock_params)
+    wrapper.offload_nodes([node.id, node.id])
+    assert len(backend.queued_offloads) == 1 + int(not loaded_pages_are_stored)
+    if not loaded_pages_are_stored:
+        assert not node.external_cache_stored
+        assert node.write_through_pending_id == node.id
+        backend.completed_offloads.append(True)
+        wrapper.commit_completed_offloads(wrapper.take_completed_offloads(1))
+        assert node.external_cache_stored
+        assert node.write_through_pending_id is None
+        wrapper.offload_nodes([node.id])
+        assert len(backend.queued_offloads) == 2
 
 
 if __name__ == "__main__":

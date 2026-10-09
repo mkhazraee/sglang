@@ -462,6 +462,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         self.config = KVCRLinkerConfig.from_extra_config(extra_config)
+        self.loaded_pages_are_stored = not self.config.direct_remote_restore
         self.page_size = params.page_size
         self._params = params
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()

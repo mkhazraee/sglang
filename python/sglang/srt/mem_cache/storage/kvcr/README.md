@@ -26,8 +26,9 @@ An example worker configuration is:
 
 ```bash
 python -m sglang.launch_server \
-  --model-path zai-org/GLM-5.2-FP8 \
-  --trust-remote-code --tp-size 8 --page-size 64 \
+  --model-path Qwen/Qwen3-32B-FP8 \
+  --trust-remote-code --tp-size 1 --page-size 64 \
+  --attention-backend flashinfer --kv-cache-dtype bfloat16 \
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend kvcr \
   --hicache-storage-backend-extra-config '{
@@ -112,13 +113,13 @@ KVCR/NIXL/UCX prerequisites above. Run the manual acceptance harness from the
 repository root; `--model-path` accepts a local checkpoint:
 
 ```bash
-python test/manual/cache/test_kvcr_linker.py --model glm52 --case local
-python test/manual/cache/test_kvcr_linker.py --model glm52 --case peer --profile
+python test/manual/cache/test_kvcr_linker.py --model qwen3 --case local
+python test/manual/cache/test_kvcr_linker.py --model qwen3 --case peer --profile
 ```
 
-This example uses TP8. Peer checks need two disjoint groups of eight visible GPUs
-on one host and, when using Guard, at least 16 Guards. Reserve control ports
-19500..19507 / 19600..19607 and NIXL ports 20500..20507 / 20600..20607.
+This example uses TP1. Peer checks need two GPUs on one host and, when using
+Guard, at least two Guards. Reserve control ports 19500 / 19600 and NIXL ports
+20500 / 20600.
 Start with fresh Guard pools for both replicas, especially the destination, so an
 old local copy cannot masquerade as peer delivery. Use a new `--pool-dir` when
 provisioning the Guard service for these checks.

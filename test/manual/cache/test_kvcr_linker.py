@@ -1,4 +1,4 @@
-"""Manual GPU acceptance for the KVCR direct linker; not registered in CI.
+"""Manual GPU acceptance for direct linkers; not registered in CI.
 
 See python/sglang/srt/mem_cache/storage/kvcr/README.md for prerequisites and
 acceptance criteria; run `python test/manual/cache/test_kvcr_linker.py --help`
@@ -28,6 +28,7 @@ from sglang.test.kl_multiturn_utils import (
     _replay_and_compare_kl,
     get_input_ids,
 )
+from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.test_utils import (
     CustomTestCase,
     find_available_port,
@@ -37,6 +38,22 @@ from sglang.test.test_utils import (
 )
 
 MODELS = {
+    "qwen3": {
+        "model": "Qwen/Qwen3-32B-FP8",
+        "tp": 1,
+        "page_size": 64,
+        # Pending FP8 calibration; inherited from the BF16 Qwen3-32B cache test.
+        "kl_threshold": 0.0025,
+        "max_total_tokens": 8192,
+        "args": [
+            "--attention-backend",
+            "flashinfer",
+            "--kv-cache-dtype",
+            "bfloat16",
+            "--mem-fraction-static",
+            "0.8",
+        ],
+    },
     "glm52": {
         "model": "zai-org/GLM-5.2-FP8",
         "tp": 8,
@@ -90,20 +107,22 @@ def peer_hint(tokens, page_size):
     }
 
 
-def save_runtime_versions(output_dir):
-    import kvcr
-
-    source = Path(kvcr.__file__).resolve()
-    try:
-        version = importlib.metadata.version("kvcr")
-    except importlib.metadata.PackageNotFoundError:
-        version = "uninstalled source checkout"
-    versions = {"kvcr_version": version, "kvcr_source": str(source)}
+def save_runtime_versions(output_dir, backend):
+    versions = {"backend": backend}
     repos = {"sglang": Path(__file__).resolve().parents[3]}
-    for parent in source.parents:
-        if (parent / ".git").exists() and (parent / "src" / "kvcr").exists():
-            repos["kvcr"] = parent
-            break
+    if backend == "kvcr":
+        import kvcr
+
+        source = Path(kvcr.__file__).resolve()
+        try:
+            version = importlib.metadata.version("kvcr")
+        except importlib.metadata.PackageNotFoundError:
+            version = "uninstalled source checkout"
+        versions.update(kvcr_version=version, kvcr_source=str(source))
+        for parent in source.parents:
+            if (parent / ".git").exists() and (parent / "src" / "kvcr").exists():
+                repos["kvcr"] = parent
+                break
     for name, repo in repos.items():
         for field, args in (
             ("commit", ["rev-parse", "HEAD"]),
@@ -137,6 +156,7 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
         if cls.options is None:
             raise RuntimeError("Run this manual test as a script with --model.")
         cls.processes, cls.log_files = [], []
+        cls.mooncake = None
         cls.config = MODELS[cls.options.model]
         needed = cls.config["tp"] * (2 if cls.options.case != "local" else 1)
         if torch.cuda.device_count() < needed:
@@ -146,8 +166,11 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
         cls.kl_threshold = cls.config["kl_threshold"]
         cls.output_dir = Path(cls.options.output_dir).resolve()
         cls.output_dir.mkdir(parents=True, exist_ok=True)
-        save_runtime_versions(cls.output_dir)
+        save_runtime_versions(cls.output_dir, cls.options.backend)
         print(f"Acceptance artifacts: {cls.output_dir}")
+        if cls.options.backend == "mooncake":
+            cls.mooncake = MooncakeTestServices()
+            cls.mooncake.start()
         cls.base_url = cls.launch(0)
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -157,10 +180,21 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
         log = (cls.output_dir / f"worker-{replica}.log").open("w")
         cls.log_files.append(log)
         env = (
-            unified_radix_tree_server_env("rust")
-            if cls.options.model == "glm52"
-            else {"SGLANG_DSV4_FP4_EXPERTS": "0"}
+            {"SGLANG_DSV4_FP4_EXPERTS": "0"}
+            if cls.options.model == "dsv4"
+            else unified_radix_tree_server_env("rust")
         )
+        extra_config = {
+            "dram_size_gb": cls.options.dram_size_gb,
+            "guard_index": replica * cls.config["tp"],
+            "control_host": "127.0.0.1",
+            "advertise_host": "127.0.0.1",
+            "control_port": 19500 + 100 * replica,
+            "nixl_port": 20500 + 100 * replica,
+        }
+        if cls.mooncake is not None:
+            env.update(cls.mooncake.server_env())
+            extra_config = {"enable_group_semantics": True}
         process = popen_launch_server(
             cls.model,
             base_url,
@@ -185,18 +219,9 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "debug",
                 "--enable-unified-cache-external-linker",
                 "--unified-cache-external-linker-backend",
-                "kvcr",
+                cls.options.backend,
                 "--hicache-storage-backend-extra-config",
-                json.dumps(
-                    {
-                        "dram_size_gb": cls.options.dram_size_gb,
-                        "guard_index": replica * cls.config["tp"],
-                        "control_host": "127.0.0.1",
-                        "advertise_host": "127.0.0.1",
-                        "control_port": 19500 + 100 * replica,
-                        "nixl_port": 20500 + 100 * replica,
-                    }
-                ),
+                json.dumps(extra_config),
                 *cls.config["args"],
             ],
         )
@@ -206,6 +231,8 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         with ExitStack() as cleanup:
+            if getattr(cls, "mooncake", None) is not None:
+                cleanup.callback(cls.mooncake.stop)
             for log in getattr(cls, "log_files", []):
                 cleanup.callback(log.close)
             for process in getattr(cls, "processes", []):
@@ -249,8 +276,13 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
         self.host_tokens = 0
         with self.profile(self.base_url, case.__name__):
             case()
-        self.assertGreater(self.host_tokens, 0, "No KVCR local DRAM reload occurred")
-        print(f"{case.__name__}: restored {self.host_tokens} tokens from local DRAM")
+        self.assertGreater(
+            self.host_tokens, 0, f"No {self.options.backend} load-back occurred"
+        )
+        print(
+            f"{case.__name__}: restored {self.host_tokens} tokens through "
+            f"{self.options.backend}"
+        )
 
     def test_multiturn_logprobs_match(self):
         self.run_local_case(super().test_multiturn_logprobs_match)
@@ -376,11 +408,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model", required=True, choices=MODELS)
     parser.add_argument("--model-path", help="Local checkpoint override")
+    parser.add_argument("--backend", choices=("kvcr", "mooncake"), default="kvcr")
     parser.add_argument("--case", choices=("local", "peer", "all"), default="local")
     parser.add_argument("--dram-size-gb", type=float, default=8)
     parser.add_argument("--output-dir", default=f"/tmp/sglang-kvcr-{int(time.time())}")
     parser.add_argument("--profile", action="store_true")
     options = parser.parse_args()
+    if options.backend == "mooncake" and options.case != "local":
+        parser.error("Mooncake supports --case local here; peer hints require KVCR.")
     TestKVCRLinker.options = options
     names = []
     if options.case != "peer":

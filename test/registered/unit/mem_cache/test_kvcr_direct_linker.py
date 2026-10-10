@@ -533,6 +533,11 @@ class TestKVCRRuntime(CustomTestCase):
 
         self.runtime_type = KVCRRuntime
         self.startup_error = type("KVCRStartupError", (RuntimeError,), {})
+        self.service_error = type("KVCRServiceError", (RuntimeError,), {})
+        self.socket_error = type("KVCRSocketError", (self.service_error,), {})
+        self.guard_error = self.socket_error("Guard unavailable")
+        self.guard_error.__cause__ = FileNotFoundError()
+        self.attempts = []
         self.local_tier = object()
         self.constructor_error = None
         self.close_error = False
@@ -541,11 +546,18 @@ class TestKVCRRuntime(CustomTestCase):
             if self.close_error:
                 raise RuntimeError("DMA is still active")
 
-        def client(config, bindings, backends):
+        def client(config, bindings, backends, guard_config=None):
+            self.attempts.append(guard_config)
+            if guard_config is not None and self.guard_error is not None:
+                raise self.guard_error
             if self.constructor_error is not None:
                 raise self.constructor_error
             return SimpleNamespace(
-                config=config, bindings=bindings, backends=backends, close=close
+                config=config,
+                bindings=bindings,
+                backends=backends,
+                guard_config=guard_config,
+                close=close,
             )
 
         modules = {
@@ -554,9 +566,11 @@ class TestKVCRRuntime(CustomTestCase):
         }
         modules["kvcr"].KVCR = client
         modules["kvcr"].KVCRBindings = SimpleNamespace
+        modules["kvcr"].KVCRSocketError = self.socket_error
         config_module = modules["kvcr.config"]
         config_module.KVCRConfig = SimpleNamespace
         config_module.KVCRBackendConfigs = SimpleNamespace
+        config_module.KVCRGuardConfig = SimpleNamespace
         config_module.LocalDramOptions = lambda pools: SimpleNamespace(pools=pools)
         config_module.RemoteFWDramOptions = SimpleNamespace
         modules["kvcr.control_channels"].ZmqPeerControlChannel = (
@@ -571,20 +585,73 @@ class TestKVCRRuntime(CustomTestCase):
         self.addCleanup(scoped_modules.stop)
         self.layout = SimpleNamespace(
             endpoint_name="test-rank",
+            namespace="model-layout-shard",
             pool_layouts=[("small", 8), ("large", 24)],
             pool_counts={"small": 2, "large": 2},
             registrations=[],
             decode_key=lambda key: tuple(key.decode().split(":", 1)),
         )
 
-    def make_runtime(self):
+    def make_runtime(self, **options):
         runtime = self.runtime_type(
             self.layout,
-            {"dram_size_gb": 128 / (1 << 30), "advertise_host": "127.0.0.1"},
+            {"dram_size_gb": 128 / (1 << 30), "advertise_host": "127.0.0.1", **options},
             rank=2,
         )
         self.addCleanup(runtime.close)
         return runtime
+
+    def test_guard_is_default_and_allocates_no_process_dram(self):
+        self.guard_error = None
+        with patch("mmap.mmap", side_effect=AssertionError("unexpected allocation")):
+            runtime = self.make_runtime()
+        guard = runtime.client.guard_config
+        self.assertEqual(guard.kvcr_service_socket_path, "/run/kvcr/memory.sock")
+        self.assertEqual(guard.guard_index, 2)
+        self.assertEqual(guard.compatibility_digest, self.layout.namespace)
+        self.assertIsNone(runtime.client.backends.local_dram)
+        self.assertFalse(runtime._buffers)
+        configured = self.make_runtime(
+            kvcr_service_socket_path="/tmp/kvcr.sock",
+            guard_index=4,
+            compatibility_digest="deployment-layout",
+        ).client.guard_config
+        self.assertEqual(configured.kvcr_service_socket_path, "/tmp/kvcr.sock")
+        self.assertEqual(configured.guard_index, 6)
+        self.assertEqual(configured.compatibility_digest, "deployment-layout")
+
+    def test_guard_connection_refused_or_disabled_uses_process_dram(self):
+        self.guard_error.__cause__ = ConnectionRefusedError()
+        runtime = self.make_runtime()
+        self.assertEqual(len(runtime._buffers), 2)
+        self.assertEqual(len(self.attempts), 2)
+        self.assertIsNone(self.attempts[-1])
+        self.attempts.clear()
+        runtime = self.make_runtime(kvcr_service_socket_path=None)
+        self.assertEqual(len(runtime._buffers), 2)
+        self.assertEqual(self.attempts, [None])
+
+    def test_refused_or_uncertain_guard_claim_never_falls_back(self):
+        for error in (
+            self.service_error("incompatible or busy Guard"),
+            self.startup_error("native resources retained"),
+            PermissionError(),
+            TimeoutError(),
+            EOFError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.guard_error = error
+                if isinstance(error, OSError) or isinstance(error, EOFError):
+                    self.guard_error = self.socket_error("claim failed")
+                    self.guard_error.__cause__ = error
+                with patch("mmap.mmap", side_effect=AssertionError("unsafe fallback")):
+                    with self.assertRaises(type(self.guard_error)) as caught:
+                        self.make_runtime()
+                if isinstance(error, self.startup_error):
+                    runtime = caught.exception.kvcr_runtime
+                    self.assertFalse(runtime._buffers)
+                    with self.assertRaisesRegex(RuntimeError, "startup"):
+                        runtime.close()
 
     def test_capacity_preserves_equal_page_counts_and_shifts_ports(self):
         runtime = self.make_runtime()
@@ -595,6 +662,8 @@ class TestKVCRRuntime(CustomTestCase):
         self.assertEqual(runtime.client.config.nixl_listen_port, 20502)
         self.assertEqual(runtime.client.bindings.framework_control.port, 19502)
         self.assertFalse(runtime.client.backends.remote_fw_dram.opportunistic_query)
+        self.assertEqual(len(self.attempts), 2)
+        self.assertIsNone(self.attempts[-1])
 
     def test_declines_pins_and_cancels_removals_per_physical_key(self):
         runtime = self.make_runtime()
@@ -651,6 +720,10 @@ class TestKVCRRuntime(CustomTestCase):
             {"control_port": 65535},
             {"operation_timeout_ms": 0},
             {"abandon_timeout_ms": 1000},
+            {"kvcr_service_socket_path": ""},
+            {"guard_index": -1},
+            {"guard_index": True},
+            {"compatibility_digest": ""},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.runtime_type(self.layout, options, rank=2)

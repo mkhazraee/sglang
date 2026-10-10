@@ -9,20 +9,18 @@ completed deposits in KVCR-owned DRAM. G3, `fetch`, and framework-owned source
 serving are outside this integration.
 
 Install KVCR with its NIXL/UCX dependencies in the serving environment. This
-integration uses the public API inspected at KVCR commit
-`4be5f9b07f16405b05a7bcccb2b0608af949fa86` (PR #75, labelled-key metadata caching).
+integration uses the public API inspected at KVCR commit `8a91e20`, including
+the timeout ownership fix and PR #75 (labelled-key metadata caching).
 [PR #64](https://github.com/ai-dynamo/kvcr/pull/64), Python allocation optimizations,
 was still open at `0e33b521f35dbbb1cd28bf315f66f26382ab7252` and was absent from
 that baseline. No performance result here assumes it is installed.
 
-**The inspected baseline alone is insufficient for safe timeout handling.** A
-KVCR revision with the local-copy timeout lifecycle fix is required: pending
+KVCR's local-copy timeout lifecycle fix is required: pending
 native transfers must retain their handles and memory, report `uncertain` before
 returning failure, and report `quiesced` only after native access stops. The
-inspected checkout had that fix under development as uncommitted changes; no
-verified fixed revision is pinned here yet. Adapter-side retention cannot repair
-a native transfer handle that KVCR has already forgotten. KVCR is an external
-prerequisite and is not patched by this integration.
+fix is present in `8a91e20`; GPU validation remains pending. Adapter-side
+retention cannot repair a native transfer handle that KVCR has already
+forgotten. KVCR is an external prerequisite and is not patched here.
 
 An example worker configuration is:
 
@@ -48,7 +46,10 @@ are strict; unknown names fail startup.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `dram_size_gb` | `1` | GiB of local DRAM per rank, rounded down to complete pages across all pools. |
+| `kvcr_service_socket_path` | `/run/kvcr/memory.sock` | Guard service socket; `null` explicitly selects in-process DRAM. |
+| `guard_index` | `0` | Base Guard index; the global rank is added. |
+| `compatibility_digest` | Model/layout/shard namespace | Must match the Guard service's deployment compatibility digest. |
+| `dram_size_gb` | `1` | Fallback in-process DRAM GiB per rank, rounded down to complete pages across all pools. |
 | `control_host` | `0.0.0.0` | Address on which KVCR binds peer control. |
 | `advertise_host` | Resolved local hostname | Address peers use to reach this worker. |
 | `control_port` | `19500` | Base control port; the global rank is added. |
@@ -56,12 +57,34 @@ are strict; unknown names fail startup.
 | `operation_timeout_ms` | `1000` | Positive operation deadline in milliseconds. |
 | `abandon_timeout_ms` | `5000` | Failure-reporting deadline, at least twice the operation timeout. |
 
-Reserve nonoverlapping port ranges for separate serving instances. Each pool
-receives capacity proportional to its bytes per physical page, giving all pools
-the same page capacity. Anonymous DRAM mappings and GPU registrations remain
-owned until successful KVCR shutdown. A shutdown error retains the mappings;
+Workers first claim Guard-backed memory through KVCR's public API. A missing
+socket or refused connection falls back to anonymous DRAM inside the serving
+process. An incompatible/busy Guard, permission error, or interrupted claim
+fails startup: these do not prove that falling back is safe. KVCR owns Guard
+claiming, recovery, and release; SGLang does not allocate a second DRAM pool
+when a claim succeeds.
+
+Provision the service using KVCR's `python -m kvcr.kvcr_service` command with
+`--socket-path`, `--pool-dir`, `--guard-count`, `--pool-sizes-gb`, and
+`--compatibility-digest`. Startup logs include the requested digest and ordered
+pool layouts (name and block bytes). The service's ordered pool capacities, not
+`dram_size_gb`, size Guard memory. Allocate a distinct Guard index per worker;
+reserve separate index ranges and ports for colocated replicas. A service has
+one digest across its Guards. For nonreplicated TP shards, set the same explicit
+deployment digest on the service and all workers; change it when the model,
+dtype, layout, page size, or parallel topology changes. Storage keys still retain
+their individual shard namespaces.
+
+In fallback mode, each pool receives capacity proportional to its bytes per
+physical page, giving all pools the same page capacity. DRAM and GPU
+registrations remain owned until successful KVCR shutdown. A shutdown error retains the mappings;
 an uncertain transfer keeps its affected GPU pages unavailable for reuse until
 quiescence is established.
+
+As with other external Linkers, `flush_cache` drains transfers but does not
+clear Guard storage. Recovered KV is valid only for unchanged model weights and
+layout. Online weight replacement requires a fresh model/cache identity or
+restarting with cleared storage and matching peers; flush alone is insufficient.
 
 Remote hints use KVCR's versioned `kv.fetch` envelope, with a reachable
 `source_control_endpoint` and uint64 `block_hashes`. Hints are advisory. The
@@ -84,8 +107,8 @@ Other model layouts, G3, and `--enable-linker-mla-dedup` are unsupported.
 
 GPU validation is pending: local deposit/reload, peer direct delivery,
 multiturn continuation, TP, idle source serving, concurrent load/offload,
-timeout quarantine and shutdown, and layerwise overlap must be checked with
-the fixed KVCR revision. CPU contract tests do not establish GPU correctness
+Guard claim/recovery, timeout quarantine and shutdown, and layerwise overlap
+must be checked with the fixed KVCR revision. CPU contract tests do not establish GPU correctness
 or performance. `nvidia-smi` could not access the driver on this machine.
 
 The SGLang base revision is `1814ece57f`; record the final SGLang and KVCR
@@ -102,12 +125,14 @@ python test/manual/cache/test_kvcr_linker.py --model dsv4 --case all --profile
 ```
 
 GLM-5.2 uses TP8 and DeepSeek-V4 uses TP4. Peer tests need two disjoint groups
-(16 or 8 GPUs respectively). `--output-dir` retains logs, revision metadata,
+(16 or 8 GPUs respectively) and, when using Guard, at least that many Guards.
+Start acceptance with fresh Guard pools, especially the destination's pools,
+so an old local copy cannot masquerade as peer delivery. `--output-dir` retains logs, revision metadata,
 and optional profiles. These commands have been checked for CLI/schema
 compatibility but have not been run on GPU.
 
 CPU validation on this branch: 62 shared-Linker tests passed (14 CUDA tests
-skipped), 16 layout tests passed, 19 backend/runtime tests passed, and 24
+skipped), 16 layout tests passed, 23 backend/runtime tests passed, and 24
 registry tests passed. The Rust tree suite passed 923 tests (one existing
 ignored test), and its Python bindings passed `cargo check`. Run each Python
 file in its own process, as CI does:

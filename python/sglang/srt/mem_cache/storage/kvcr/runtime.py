@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import math
 import mmap
 import socket
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 
 class KVCRRuntime:
@@ -13,6 +16,9 @@ class KVCRRuntime:
     def __init__(self, layout, options: dict, *, rank: int):
         defaults = {
             "dram_size_gb": 1,
+            "kvcr_service_socket_path": "/run/kvcr/memory.sock",
+            "guard_index": 0,
+            "compatibility_digest": layout.namespace,
             "control_host": "0.0.0.0",
             "advertise_host": None,
             "control_port": 19500,
@@ -26,6 +32,18 @@ class KVCRRuntime:
         config = defaults | options
         if type(rank) is not int or rank < 0:
             raise ValueError("KVCR rank must be a nonnegative integer")
+        guard_socket = config["kvcr_service_socket_path"]
+        if guard_socket is not None and (
+            not isinstance(guard_socket, str) or not guard_socket
+        ):
+            raise ValueError("KVCR kvcr_service_socket_path must be a path or null")
+        if type(config["guard_index"]) is not int or config["guard_index"] < 0:
+            raise ValueError("KVCR guard_index must be a nonnegative integer")
+        if (
+            not isinstance(config["compatibility_digest"], str)
+            or not config["compatibility_digest"]
+        ):
+            raise ValueError("KVCR compatibility_digest must be a nonempty string")
         size_gb = config["dram_size_gb"]
         if (
             isinstance(size_gb, bool)
@@ -60,10 +78,11 @@ class KVCRRuntime:
             if not isinstance(config[name], str) or not config[name]:
                 raise ValueError(f"KVCR {name} must be a nonempty host")
 
-        from kvcr import KVCR, KVCRBindings
+        from kvcr import KVCR, KVCRBindings, KVCRSocketError
         from kvcr.config import (
             KVCRBackendConfigs,
             KVCRConfig,
+            KVCRGuardConfig,
             LocalDramOptions,
             RemoteFWDramOptions,
         )
@@ -89,6 +108,57 @@ class KVCRRuntime:
                             self.removals.pop(key, None)
 
         try:
+            kvcr_config = KVCRConfig(
+                nixl_agent_name=layout.endpoint_name,
+                pool_layouts=layout.pool_layouts,
+                nixl_listen_port=config["nixl_port"],
+                operation_timeout_ms=config["operation_timeout_ms"],
+                abandon_timeout_ms=config["abandon_timeout_ms"],
+            )
+            bindings = KVCRBindings(
+                request_pin=self._decline_pin,
+                poll_pin_results=self._poll_pin_results,
+                release_pin=lambda _: True,
+                cancel_pin_request=lambda request: self._pin_results.pop(request, None),
+                framework_control=ZmqPeerControlChannel(
+                    config["control_host"],
+                    config["control_port"],
+                    config["advertise_host"],
+                ),
+                key_adapter=self,
+                inventory_sink=inventory,
+                on_resilience_event=self.events.append,
+            )
+            if guard_socket is not None:
+                guard = KVCRGuardConfig(
+                    kvcr_service_socket_path=guard_socket,
+                    guard_index=config["guard_index"] + rank,
+                    compatibility_digest=config["compatibility_digest"],
+                )
+                logger.info(
+                    "KVCR Guard: %s, pool layouts: %s", guard, layout.pool_layouts
+                )
+                try:
+                    self.client = KVCR(
+                        kvcr_config,
+                        bindings,
+                        KVCRBackendConfigs(
+                            framework_regions=layout.registrations,
+                            local_dram=None,
+                            remote_fw_dram=RemoteFWDramOptions(
+                                opportunistic_query=False
+                            ),
+                        ),
+                        guard,
+                    )
+                    return
+                except KVCRSocketError as error:
+                    # A lost claim reply can leave a live lease; only retry before connect.
+                    if not isinstance(
+                        error.__cause__, (FileNotFoundError, ConnectionRefusedError)
+                    ):
+                        raise
+                    logger.warning("%s; using in-process KVCR DRAM", error)
             pools = []
             for name, size in layout.pool_layouts:
                 length = page_count * layout.pool_counts[name] * size
@@ -97,29 +167,8 @@ class KVCRRuntime:
                 address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
                 pools.append((name, address, length))
             self.client = KVCR(
-                KVCRConfig(
-                    nixl_agent_name=layout.endpoint_name,
-                    pool_layouts=layout.pool_layouts,
-                    nixl_listen_port=config["nixl_port"],
-                    operation_timeout_ms=config["operation_timeout_ms"],
-                    abandon_timeout_ms=config["abandon_timeout_ms"],
-                ),
-                KVCRBindings(
-                    request_pin=self._decline_pin,
-                    poll_pin_results=self._poll_pin_results,
-                    release_pin=lambda _: True,
-                    cancel_pin_request=lambda request: self._pin_results.pop(
-                        request, None
-                    ),
-                    framework_control=ZmqPeerControlChannel(
-                        config["control_host"],
-                        config["control_port"],
-                        config["advertise_host"],
-                    ),
-                    key_adapter=self,
-                    inventory_sink=inventory,
-                    on_resilience_event=self.events.append,
-                ),
+                kvcr_config,
+                bindings,
                 KVCRBackendConfigs(
                     framework_regions=layout.registrations,
                     local_dram=LocalDramOptions(pools),

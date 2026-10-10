@@ -215,6 +215,7 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
                 json.dumps(
                     {
                         "dram_size_gb": cls.options.dram_size_gb,
+                        "guard_index": replica * cls.config["tp"],
                         "control_host": "127.0.0.1",
                         "advertise_host": "127.0.0.1",
                         "control_port": 19500 + 100 * replica,
@@ -285,7 +286,9 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
     def test_multiturn_decode_cache_hit_branching(self):
         self.run_local_case(super().test_multiturn_decode_cache_hit_branching)
 
-    def generate(self, base_url, tokens, *, hint=None, max_new_tokens=64):
+    def generate(
+        self, base_url, tokens, *, hint=None, max_new_tokens=64, logprob_start_len=-1
+    ):
         payload = {
             "input_ids": tokens,
             "sampling_params": {
@@ -294,6 +297,7 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "ignore_eos": True,
             },
             "return_logprob": True,
+            "logprob_start_len": logprob_start_len,
             "return_text_in_logprobs": False,
         }
         if hint is not None:
@@ -323,7 +327,10 @@ class TestKVCRLinker(UnifiedRadixTreeTestMixin, CustomTestCase):
             if len(prompts) == 2:
                 break
         self.assertEqual(len(prompts), 2, "Need two page-aligned LongBench prefixes")
-        baselines = [self.generate(self.base_url, prompt) for prompt in prompts]
+        baselines = [
+            self.generate(self.base_url, prompt, logprob_start_len=0)
+            for prompt in prompts
+        ]
         self.assertTrue(
             all(item["meta_info"]["cached_tokens"] == 0 for item in baselines)
         )

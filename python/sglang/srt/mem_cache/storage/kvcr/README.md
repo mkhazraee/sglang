@@ -101,9 +101,17 @@ source endpoint. CP/PP or nonreplicated TP shards need hints targeting their
 matching source shard; remote hints are disabled for those layouts. Local
 reuse remains enabled. This adapter does not rewrite hint endpoints.
 
-The initial layouts are DSA (`zai-org/GLM-5.2-FP8`) and DeepSeek-V4
-(`sgl-project/DeepSeek-V4-Flash-FP8`), using the existing device-pool assembler.
-Other model layouts, G3, and `--enable-linker-mla-dedup` are unsupported.
+Supported pool descriptions are DSA (`zai-org/GLM-5.2-FP8`), DeepSeek-V4
+(`sgl-project/DeepSeek-V4-Flash-FP8`), and plain MHA
+(`Qwen/Qwen3-32B-FP8`). The shared MHA description enables both Mooncake and
+KVCR: each page contains packed K and V buffers with per-layer ranges. Existing
+attention-side layer waits provide progressive readiness. NHD and HND layouts
+are covered by CPU tests; MHA draft pools and caches with separate scale buffers
+are rejected. G3 and `--enable-linker-mla-dedup` remain unsupported by KVCR.
+
+The Qwen acceptance preset uses TP1, FlashInfer, page size 64, and BF16 KV;
+FP8 in the model name describes its weights. Qwen KVCR peer reuse is limited
+to TP1 by the existing shard-hint restriction; local reuse supports TP.
 
 GPU validation is pending: local deposit/reload, peer direct delivery,
 multiturn continuation, TP, idle source serving, concurrent load/offload,
@@ -122,17 +130,21 @@ Run the manual acceptance harness from the repository root:
 ```bash
 python test/manual/cache/test_kvcr_linker.py --model glm52 --case local
 python test/manual/cache/test_kvcr_linker.py --model dsv4 --case all --profile
+python test/manual/cache/test_kvcr_linker.py --model qwen3 --case all --profile
+python test/manual/cache/test_kvcr_linker.py --model qwen3 --backend mooncake
 ```
 
-GLM-5.2 uses TP8 and DeepSeek-V4 uses TP4. Peer tests need two disjoint groups
-(16 or 8 GPUs respectively) and, when using Guard, at least that many Guards.
+GLM-5.2 uses TP8, DeepSeek-V4 TP4, and Qwen TP1. KVCR peer tests need two
+disjoint groups (16, 8, or 2 GPUs respectively) and, when using Guard, at least
+that many Guards. Mooncake runs local cases using the existing test services.
 Start acceptance with fresh Guard pools, especially the destination's pools,
 so an old local copy cannot masquerade as peer delivery. `--output-dir` retains logs, revision metadata,
 and optional profiles. These commands have been checked for CLI/schema
-compatibility but have not been run on GPU.
+compatibility but have not been run on GPU. Qwen's provisional KL threshold
+comes from the BF16 Qwen3-32B test and needs calibration for FP8 weights.
 
 CPU validation on this branch: 62 shared-Linker tests passed (14 CUDA tests
-skipped), 16 layout tests passed, 23 backend/runtime tests passed, and 24
+skipped), 18 layout tests passed, 23 backend/runtime tests passed, and 24
 registry tests passed. The Rust tree suite passed 923 tests (one existing
 ignored test), and its Python bindings passed `cargo check`. Run each Python
 file in its own process, as CI does:

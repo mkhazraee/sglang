@@ -729,5 +729,77 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
 
 
+class TestMhaDevicePoolAssembler(CustomTestCase):
+    @staticmethod
+    def pool(*, hnd=False, dtype=torch.bfloat16):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        with envs.SGLANG_USE_HND_KVCACHE.override(hnd):
+            return MHATokenToKVPool(
+                size=6,
+                page_size=2,
+                dtype=dtype,
+                head_num=2,
+                head_dim=3,
+                v_head_dim=5,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            )
+
+    @staticmethod
+    def group(pool, *, page_size=2, drafts=()):
+        return resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=page_size,
+            params=SimpleNamespace(mtp_draft_device_pools=drafts),
+            components={ComponentType.FULL},
+        )
+
+    def test_mha_packs_key_and_value_pages_for_each_layer(self):
+        for hnd in (False, True):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(hnd=hnd, dtype=dtype):
+                    pool = self.pool(hnd=hnd, dtype=dtype)
+                    group = self.group(pool)
+                    self.assertFalse(group.rank_replicated)
+                    self.assertEqual(group.num_layers, 2)
+                    self.assertEqual(group.sources, {PoolName.KV: PoolName.KV})
+                    entry = group.entry_map[PoolName.KV]
+                    row = 1 if hnd else 2
+                    buffers = pool.k_buffer + pool.v_buffer
+                    pointers = [buffer[row].data_ptr() for buffer in buffers]
+                    element_size = pool.k_buffer[0].element_size()
+                    sizes = [12 * element_size] * 2 + [20 * element_size] * 2
+                    indices = torch.tensor([2, 3])
+                    self.assertEqual(
+                        entry.get_page_buffer_meta(indices), (pointers, sizes)
+                    )
+                    self.assertEqual(entry.prepare_locations(indices), [row])
+                    layer_pointers, layer_sizes, offsets = (
+                        entry.get_prepared_layer_range_meta([row], 1)
+                    )
+                    self.assertEqual(layer_pointers, [[pointers[1], pointers[3]]])
+                    self.assertEqual(layer_sizes, [[sizes[1], sizes[3]]])
+                    self.assertEqual(offsets, [[sizes[0], sum(sizes[:3])]])
+                    self.assertEqual(entry.device_pool.dtype, dtype)
+
+    def test_mha_rejects_incomplete_or_incompatible_pool_layouts(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+
+        with self.assertRaisesRegex(ValueError, "MHATokenToKVPoolMXFP8"):
+            self.group(MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8))
+        pool = self.pool()
+        with self.assertRaisesRegex(ValueError, "page size"):
+            self.group(pool, page_size=4)
+        with self.assertRaisesRegex(ValueError, "draft"):
+            self.group(pool, drafts=(self.pool(),))
+        pool.quant_method = object()
+        with self.assertRaisesRegex(ValueError, "scale buffers"):
+            self.group(pool)
+
+
 if __name__ == "__main__":
     unittest.main()

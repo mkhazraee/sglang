@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
 
@@ -106,6 +106,7 @@ class _Offload:
     ready: object
     dependencies: tuple[_Load, ...]
     keys: set[bytes]
+    preparation: Future | None = None
     work: object = None
     active: int = 0
     exhausted: bool = False
@@ -223,7 +224,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._queued = []
         self._batches = deque()
         self._offloads = deque()
+        # Only the scheduler acknowledges offloads and suppresses their evictions.
         self._unacknowledged_keys = Counter()
+        self._preparer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kvcr-offload-prepare"
+        )
         self._operations = {}
         self._hazards = set()
         self._scopes = {}
@@ -240,13 +245,22 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._thread.start()
         self._started.result()
 
-    def _call(self, function, *args):
-        future = Future()
+    def _raise_if_failed(self):
+        if self._fatal is not None:
+            raise self._fatal
+
+    def _send(self, function, *args, wait=False):
+        future = Future() if wait else None
         with self._command_lock:
             if self._closed:
                 raise RuntimeError("KVCR linker is closed")
+            if function != self._close:
+                self._raise_if_failed()
             self._commands.put((function, args, future))
-        return future.result()
+        return future
+
+    def _call(self, function, *args):
+        return self._send(function, *args, wait=True).result()
 
     def _run(self):
         try:
@@ -278,15 +292,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 try:
                     if self._fatal is not None and function != self._close:
                         raise self._fatal
-                    future.set_result(function(*args))
+                    result = function(*args)
+                    if future is not None:
+                        future.set_result(result)
                 except BaseException as error:
-                    if function in (self._close, self._reset):
+                    if future is None or function in (self._close, self._reset):
                         if hasattr(error, "kvcr_runtime"):
                             self._runtime = error.kvcr_runtime
                         self._fatal = error
                         for batch in self._batches:
                             self._fail_batch(batch, error)
-                    future.set_exception(error)
+                    if future is not None:
+                        future.set_exception(error)
+                    else:
+                        logger.exception("KVCR asynchronous command failed")
             if self._fatal is None and not self._closed:
                 try:
                     self._progress()
@@ -303,7 +322,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 _, _, future = self._commands.get_nowait()
             except Empty:
                 break
-            future.set_exception(RuntimeError("KVCR linker is closed"))
+            if future is not None:
+                future.set_exception(RuntimeError("KVCR linker is closed"))
 
     def set_request_context(self, handle, kv_hints):
         hints = (
@@ -330,7 +350,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
 
     def release_request_context(self, handle):
         if not self._closed:
-            self._call(self._release_context, handle)
+            self._send(self._release_context, handle)
 
     def _release_context(self, handle):
         scope = self._scopes.pop(handle, None)
@@ -476,8 +496,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def start_layer_wise_loading(self):
         if self._closed:
             raise RuntimeError("KVCR linker is closed")
-        if self._fatal is not None:
-            raise self._fatal
+        self._raise_if_failed()
         # Synchronous load/start/reset calls keep this queue visible to the scheduler.
         if not self._queued:
             return -1
@@ -534,14 +553,14 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         ready = torch.cuda.Event()
         ready.record()
-        return self._call(self._offload, transfers, ready, keys)
+        self._send(self._offload, transfers, ready, keys)
+        self._unacknowledged_keys.update(keys)
+        return True
 
     def _offload(self, transfers, ready, keys):
-        self._unacknowledged_keys.update(keys)
         self._offloads.append(
             _Offload(transfers, ready, tuple(self._loads.values()), keys)
         )
-        return True
 
     def _prepare_offload(self, transfers):
         prepared = self.layout.prepare(list(transfers), allow_partial=True)
@@ -654,11 +673,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 if not self._commands.empty():
                     return
                 if task.work is None:
+                    if task.preparation is None:
+                        task.preparation = self._preparer.submit(
+                            self._prepare_offload, task.transfers
+                        )
+                    if not task.preparation.done():
+                        return
                     try:
-                        task.work = iter(self._prepare_offload(task.transfers))
+                        task.work = iter(task.preparation.result())
                     except Exception:
                         logger.exception("KVCR offload preparation failed")
                         task.success, task.exhausted = False, True
+                    finally:
+                        task.preparation = None
                 if not task.exhausted:
                     blocks = next(task.work, None)
                     if blocks is None:
@@ -682,18 +709,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.complete(batch.index, layer)
 
     def num_completed_loads(self):
+        self._raise_if_failed()
         return self._completed_loads.qsize()
 
     def pop_completed_load(self):
+        self._raise_if_failed()
         return self._completed_loads.get_nowait()
 
     def num_completed_offloads(self):
+        self._raise_if_failed()
         return self._completed_offloads.qsize()
 
     def pop_completed_offload(self):
-        return self._call(self._pop_completed_offload)
-
-    def _pop_completed_offload(self):
+        self._raise_if_failed()
         success, keys = self._completed_offloads.get_nowait()
         for key in keys:
             self._unacknowledged_keys[key] -= 1
@@ -702,20 +730,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return success
 
     def pop_storage_removals(self):
-        return self._call(self._pop_storage_removals)
-
-    def _pop_storage_removals(self):
+        self._raise_if_failed()
         # A delayed rank-agreed acknowledgement must not resurrect an eviction.
-        return [
-            self._runtime.removals.pop(key)
-            for key in list(self._runtime.removals)
-            if key not in self._unacknowledged_keys
-        ]
+        with self._runtime.inventory_lock:
+            return [
+                self._runtime.removals.pop(key)
+                for key in list(self._runtime.removals)
+                if key not in self._unacknowledged_keys
+            ]
 
     def reset(self):
         self._call(self._reset)
 
     def _reset(self):
+        self._preparer.shutdown(wait=True, cancel_futures=True)
         self._runtime.close()
         removals = self._runtime.removals
         for batch in self._batches:
@@ -735,6 +763,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._completed_offloads = Queue()
         self.layer_done_counter.reset()
         self._runtime = self._make_runtime()
+        self._preparer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kvcr-offload-prepare"
+        )
         # Engine reset must not drop pending removals from retained inventory.
         self._runtime.removals.update(removals)
 
@@ -744,6 +775,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._thread.join()
 
     def _close(self):
+        self._preparer.shutdown(wait=True, cancel_futures=True)
         self._runtime.close()
         self._lookup_claims.clear()
         for batch in self._batches:

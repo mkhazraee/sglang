@@ -13,6 +13,10 @@ remain held through GPU loading. A missing window retries a shorter shared
 boundary; sparse state can require several probes. Full-prefix KV still uses
 direct delivery, and layouts without trailing state skip this confirmation.
 
+Offloads snapshot their source indices, then prepare complete mappings in one
+background task after the producer event is ready. KVCR API calls stay on the
+owner thread, with one whole-key deposit outstanding at a time.
+
 ## Setup
 
 Install KVCR with its NIXL/UCX dependencies in the serving environment. Use the

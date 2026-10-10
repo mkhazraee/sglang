@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
-from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
@@ -19,6 +18,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
+)
+from sglang.srt.mem_cache.unified_cache.layer_wise_load_counter import (
+    LayerWiseLoadCounter,
 )
 from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
     LinkerMLADedupBroadcaster,
@@ -43,53 +45,6 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
-
-
-class LayerWiseLoadCounter:
-    """CPU completion counter compatible with KV pools' layer wait hook."""
-
-    def __init__(self, num_layers: int, on_layer_ready=None):
-        self.num_layers = num_layers
-        self.on_layer_ready = on_layer_ready
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures: dict[int, list[Future]] = {}
-
-    def update_producer(self) -> int:
-        self.producer_index += 1
-        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
-        return self.producer_index
-
-    def set_consumer(self, index: int) -> None:
-        self.consumer_index = index
-
-    def complete(self, index: int, layer: int) -> None:
-        self.futures[index][layer].set_result(None)
-
-    def fail(self, index: int, error: BaseException) -> None:
-        for future in self.futures.get(index, ()):
-            if not future.done():
-                future.set_exception(error)
-
-    def wait_until(self, threshold: int) -> None:
-        index = self.consumer_index
-        futures = self.futures.get(index)
-        if futures is None:
-            return
-        try:
-            futures[threshold].result()
-            if self.on_layer_ready is not None:
-                self.on_layer_ready(index, threshold)
-        except BaseException as error:
-            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
-        finally:
-            if threshold == self.num_layers - 1:
-                self.futures.pop(index, None)
-
-    def reset(self) -> None:
-        self.producer_index = -1
-        self.consumer_index = -1
-        self.futures.clear()
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -182,6 +137,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.layer_done_counter = LayerWiseLoadCounter(
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
+            error_message="Mooncake layer-wise KV load failed.",
         )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(

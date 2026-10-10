@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -1047,10 +1048,15 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        return self.session.try_cache_finished_req(req)
+        claimed = self.session.try_cache_finished_req(req)
+        if claimed and self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
+        return claimed
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -2591,11 +2597,16 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
 
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        if outcome == CacheRequestOutcome.SUCCESS and self.linker is not None:
+            self.linker.release_request(handle, cancel_load=False)
+        super().finish(handle, outcome)
+
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         if self.linker is not None:
-            self.linker.release_request(rid)
+            self.linker.release_request(request)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
@@ -3485,6 +3496,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            self.linker.drain_storage_removals()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.

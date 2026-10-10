@@ -641,6 +641,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
     /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
+    // Local storage outlives its device tree nodes.
+    external_cache_event_hashes: HashMap<String, i64>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
 
@@ -832,6 +834,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_kv_cache_events: params.enable_kv_cache_events,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
+            external_cache_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
@@ -862,6 +865,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.lru_lists = Self::new_lru_lists();
         self.full_evict_device_heap.clear();
         self.namespaced_event_hashes.clear();
+        self.external_cache_event_hashes.clear();
         self.ongoing_insert_walk_state = None;
     }
 
@@ -4331,6 +4335,78 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(())
     }
 
+    pub fn record_external_cache_store(
+        &mut self,
+        node_ids: &[NodeId],
+        medium: StorageMedium,
+    ) -> Result<(), NodeAccessError> {
+        if !self.enable_kv_cache_events {
+            return Ok(());
+        }
+        let nodes = node_ids
+            .iter()
+            .map(|&id| self.arena.resolve(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for node_idx in nodes {
+            self.record_store_event_(node_idx, medium, None);
+            let node = self.arena.node(node_idx);
+            let hashes = node
+                .hash_value
+                .as_ref()
+                .expect("store event hashes its node");
+            let event_hashes: Vec<i64> = if node.namespace != KeyNamespace::default() {
+                self.namespaced_event_hashes[&node.id]
+                    .iter()
+                    .map(crate::node::hash_digest_to_int64)
+                    .collect()
+            } else {
+                hashes
+                    .iter()
+                    .map(|hash| crate::node::hash_str_to_int64(hash))
+                    .collect()
+            };
+            self.external_cache_event_hashes
+                .extend(hashes.iter().cloned().zip(event_hashes));
+        }
+        Ok(())
+    }
+
+    pub fn remove_external_cache_storage(
+        &mut self,
+        hashes: &[String],
+        medium: Option<StorageMedium>,
+    ) {
+        let removed: HashSet<_> = hashes.iter().collect();
+        let nodes: Vec<_> = self
+            .collect_all_nodes_()
+            .into_iter()
+            .filter(|&idx| {
+                let node = self.arena.node(idx);
+                node.external_cache_stored
+                    && node
+                        .hash_value
+                        .as_ref()
+                        .is_some_and(|values| values.iter().any(|key| removed.contains(key)))
+            })
+            .collect();
+        for idx in nodes {
+            self.arena.node_mut(idx).external_cache_stored = false;
+        }
+        let Some(medium) = medium else {
+            return;
+        };
+        let block_hashes: Vec<_> = hashes
+            .iter()
+            .filter_map(|key| self.external_cache_event_hashes.remove(key))
+            .collect();
+        if !block_hashes.is_empty() {
+            self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+                block_hashes,
+                medium,
+            });
+        }
+    }
+
     /// Clear the write-through-pending mark (when it matches ack_id) and record the
     /// host store event for each acked node.
     pub fn finish_write_through(
@@ -5739,6 +5815,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 pub enum StorageMedium {
     Gpu,
     Cpu,
+    Disk,
+    External,
 }
 
 impl StorageMedium {
@@ -5747,6 +5825,8 @@ impl StorageMedium {
         match self {
             StorageMedium::Gpu => "GPU",
             StorageMedium::Cpu => "CPU_PINNED",
+            StorageMedium::Disk => "DISK",
+            StorageMedium::External => "EXTERNAL",
         }
     }
 }

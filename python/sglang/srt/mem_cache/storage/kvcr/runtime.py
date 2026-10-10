@@ -5,6 +5,7 @@ import logging
 import math
 import mmap
 import socket
+import threading
 from collections import deque
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ class KVCRRuntime:
         self._layout = layout
         self.events = deque()
         self.removals = {}
+        self.inventory_lock = threading.Lock()
         self._buffers = []
         self._pin_results = {}
         self._next_pin = 0
@@ -102,10 +104,11 @@ class KVCRRuntime:
                 for key in event.keys:
                     decoded = layout.decode_key(key)
                     if decoded is not None:
-                        if event.removed:
-                            self.removals[key] = decoded[1]
-                        else:
-                            self.removals.pop(key, None)
+                        with self.inventory_lock:
+                            if event.removed:
+                                self.removals[key] = decoded[1]
+                            else:
+                                self.removals.pop(key, None)
 
         try:
             kvcr_config = KVCRConfig(

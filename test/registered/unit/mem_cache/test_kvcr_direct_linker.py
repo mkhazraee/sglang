@@ -84,6 +84,7 @@ class Runtime:
         self.client = Client()
         self.events = deque()
         self.removals = {}
+        self.inventory_lock = threading.Lock()
         self.closed = False
         self.close_error = False
 
@@ -276,6 +277,129 @@ class TestKVCRDirectLinker(CustomTestCase):
         eventually(lambda: self.linker.num_completed_offloads() == 1)
         self.assertTrue(self.linker.pop_completed_offload())
 
+    def test_offload_preparation_and_submission_do_not_block_scheduler(self):
+        """Large offloads must not stall progress or scheduler maintenance calls."""
+        handle = CacheRequestHandle("a", 0)
+        self.linker.set_request_context(handle, {"actions": []})
+        self.linker.offload(self.transfer(["done"]))
+        eventually(lambda: len(self.client.calls) == 1)
+        self.client.complete(1)
+        eventually(lambda: self.linker.num_completed_offloads() == 1)
+        preparing, prepared = threading.Event(), threading.Event()
+        depositing, submitted = threading.Event(), threading.Event()
+        returned = threading.Event()
+        mappings, deposit = self.linker.layout.mappings, self.client.deposit
+        results, errors = [], []
+
+        def prepare(*args, **kwargs):
+            preparing.set()
+            prepared.wait(10)
+            return mappings(*args, **kwargs)
+
+        def submit(blocks):
+            depositing.set()
+            submitted.wait(10)
+            return deposit(blocks)
+
+        def scheduler():
+            try:
+                results.append(self.linker.pop_completed_offload())
+                results.append(self.linker.pop_storage_removals())
+                self.linker.release_request_context(handle)
+                results.append(self.linker.offload(self.transfer(["later"], 2)))
+                key = self.linker.layout.encode_key("later", PoolName.KV)
+                with self.runtime.inventory_lock:
+                    self.runtime.removals[key] = "later"
+                # Admission must suppress evictions before the owner dequeues it.
+                results.append(self.linker.pop_storage_removals())
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                returned.set()
+
+        waiter = threading.Thread(target=scheduler)
+        with (
+            patch.object(self.linker.layout, "mappings", side_effect=prepare),
+            patch.object(self.client, "deposit", side_effect=submit),
+        ):
+            try:
+                self.linker.offload(self.transfer(["slow"], 1))
+                self.assertTrue(preparing.wait(5))
+                polls = self.client.polls
+                eventually(lambda: self.client.polls > polls + 2)
+                prepared.set()
+                self.assertTrue(depositing.wait(5))
+                waiter.start()
+                self.assertTrue(returned.wait(5), "scheduler waited for deposit")
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [True, [], True, []])
+            finally:
+                prepared.set()
+                submitted.set()
+                if waiter.ident is not None:
+                    waiter.join(5)
+        eventually(lambda: not self.client.hints)
+
+    def test_failed_preparation_is_reported_and_close_drains_next_preparation(self):
+        """Preparation failure preserves order; shutdown retains its GPU sources."""
+        preparing, prepared, closing = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        mappings, close = self.linker.layout.mappings, self.linker._close
+        runtime_close = self.runtime.close
+        errors = []
+
+        def prepare(transfers):
+            if transfers[0].keys == (
+                self.linker.layout.encode_key("bad", PoolName.KV),
+            ):
+                raise RuntimeError("mapping failed")
+            preparing.set()
+            prepared.wait(10)
+            return mappings(transfers)
+
+        def close_owner():
+            closing.set()
+            close()
+
+        def close_runtime():
+            self.assertTrue(
+                prepared.is_set(), "GPU resources released during preparation"
+            )
+            runtime_close()
+
+        def shutdown():
+            try:
+                self.linker.close()
+            except BaseException as error:
+                errors.append(error)
+
+        closer = threading.Thread(target=shutdown)
+        with (
+            patch.object(self.linker.layout, "mappings", side_effect=prepare),
+            patch.object(self.linker, "_close", side_effect=close_owner),
+            patch.object(self.runtime, "close", side_effect=close_runtime),
+        ):
+            try:
+                self.linker.offload(self.transfer(["bad"]))
+                self.linker.offload(self.transfer(["next"], 1))
+                eventually(lambda: self.linker.num_completed_offloads() == 1)
+                self.assertFalse(self.linker.pop_completed_offload())
+                self.assertTrue(preparing.wait(5))
+                self.assertEqual(self.client.calls, [])
+                closer.start()
+                self.assertTrue(closing.wait(5))
+                self.assertFalse(self.runtime.closed)
+            finally:
+                prepared.set()
+                if closer.ident is not None:
+                    closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(self.runtime.closed)
+
     def test_hint_scope_cleanup_waits_for_accepted_load(self):
         a, b = CacheRequestHandle("a", 1), CacheRequestHandle("b", 2)
         hints = {"actions": [{"source": ["a"]}]}
@@ -290,8 +414,9 @@ class TestKVCRDirectLinker(CustomTestCase):
         next_attempt = CacheRequestHandle("a", 2)
         self.linker.set_request_context(next_attempt, {"actions": [{"source": "new"}]})
         self.linker.release_request_context(b)
-        self.assertEqual(len(self.client.hints), 2)
+        eventually(lambda: len(self.client.hints) == 2)
         self.linker.release_request_context(next_attempt)
+        eventually(lambda: len(self.client.hints) == 1)
         self.assertEqual(self.client.hints, {scope: {"actions": [{"source": ["a"]}]}})
         self.linker.start_layer_wise_loading()
         eventually(lambda: len(self.client.calls) == 3)
@@ -328,6 +453,22 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.runtime.close_error = False
         self.linker.close()
         self.assertTrue(self.runtime.closed)
+
+    def test_async_cleanup_failure_reaches_scheduler_polling(self):
+        handle = CacheRequestHandle("a", 0)
+        self.linker.set_request_context(handle, {"actions": []})
+        with patch.object(
+            self.client, "discard_hint", side_effect=RuntimeError("cleanup failed")
+        ):
+            self.linker.release_request_context(handle)
+            eventually(lambda: self.linker._fatal is not None)
+        for poll in (
+            self.linker.num_completed_loads,
+            self.linker.num_completed_offloads,
+            self.linker.pop_storage_removals,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                poll()
 
     def test_lookup_checks_all_and_trailing_boundaries_for_physical_pools(self):
         from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout

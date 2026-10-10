@@ -25,8 +25,10 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     InsertParams,
     MatchResult,
@@ -45,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -62,6 +65,21 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    loaded_path_is_stored: bool = True
+    local_storage_medium: StorageMedium | None = None
+    local_storage_ownership: str | None = None
+
+    def set_request_context(
+        self, handle: CacheRequestHandle, kv_hints: KvHintsEnvelope | None
+    ) -> None:
+        """Snapshot attempt-scoped hints before lookup; retain them for accepted loads."""
+
+    def release_request_context(self, handle: CacheRequestHandle) -> None:
+        """End request scope; the backend retains hints until accepted loads drain."""
+
+    def pop_storage_removals(self) -> list[str]:
+        """Consume FULL storage hashes whose local copies were actually removed."""
+        return []
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -172,8 +190,10 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self._request_handles: dict[str, CacheRequestHandle] = {}
         # Loads in flight, each pinning its inserted endpoint until DMA completes.
         self.pending_loads: dict[str, tuple[NodeId, DecLockRefParams]] = {}
+        self._load_request_handles: dict[str, CacheRequestHandle] = {}
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
@@ -210,6 +230,13 @@ class UnifiedCacheLinkerWrapper:
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+        handle = req.cache_request_handle
+        previous = self._request_handles.get(req.rid)
+        if previous is not None and previous != handle:
+            self.release_request(previous, cancel_load=False)
+        self._request_handles[req.rid] = handle
+        self.cache_linker.set_request_context(handle, req.kv_hints)
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
@@ -387,9 +414,10 @@ class UnifiedCacheLinkerWrapper:
 
         self._queue_load(req.rid, insert_result.last_device_node, load_transfers)
 
-        cache.tree_core.mark_external_cache_stored_path(
-            insert_result.last_device_node, req.last_node
-        )
+        if self.cache_linker.loaded_path_is_stored:
+            cache.tree_core.mark_external_cache_stored_path(
+                insert_result.last_device_node, req.last_node
+            )
         return len(canonical_tail), insert_result.last_device_node
 
     def _queue_load(
@@ -408,6 +436,8 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(node_id, lock_params)
             raise RuntimeError(f"Failed to queue the linker load for rid={rid!r}.")
         self.pending_loads[rid] = (node_id, lock_params)
+        if rid in self._request_handles:
+            self._load_request_handles[rid] = self._request_handles[rid]
 
     def _update_load(
         self,
@@ -557,6 +587,7 @@ class UnifiedCacheLinkerWrapper:
             for rid in self.cache_linker.pop_completed_load():
                 node_id, lock_params = self.pending_loads.pop(rid)
                 self.cache.dec_lock_ref(node_id, lock_params)
+                self._load_request_handles.pop(rid, None)
 
     def take_completed_offloads(self, finish_count: int) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
@@ -569,7 +600,43 @@ class UnifiedCacheLinkerWrapper:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
+            if success and self.cache_linker.local_storage_medium is not None:
+                self.cache.tree_core.record_external_cache_store(
+                    pending.publish_node_ids, self.cache_linker.local_storage_medium
+                )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+
+    def drain_storage_removals(self) -> None:
+        medium = self.cache_linker.local_storage_medium
+        if medium is None:
+            return
+        hashes = self.cache_linker.pop_storage_removals()
+        any_removed = torch.tensor([bool(hashes)], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(any_removed, torch.distributed.ReduceOp.MAX)
+        if not any_removed.item():
+            return
+        all_hashes = set(hashes)
+        groups = [
+            group
+            for group in (self.cache.attn_cp_group, self.cache.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups and self.cache.tp_world_size > 1:
+            groups = [self.cache.tp_group]
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(
+                gathered, sorted(all_hashes), group=group
+            )
+            all_hashes.update(key for rank_hashes in gathered for key in rank_hashes)
+        # Offload decisions must agree, but each rank advertises its own inventory.
+        remote_hashes = all_hashes.difference(hashes)
+        if remote_hashes:
+            self.cache.tree_core.remove_external_cache_storage(
+                sorted(remote_hashes), medium, publish=False
+            )
+        if hashes:
+            self.cache.tree_core.remove_external_cache_storage(hashes, medium)
 
     def start_layer_wise_loading(self) -> int:
         return self.cache_linker.start_layer_wise_loading()
@@ -580,11 +647,13 @@ class UnifiedCacheLinkerWrapper:
         self.cache_linker.reset()
         self.hit_markers.clear()
         self._release_pending_locks()
+        self._release_request_contexts()
 
     def _release_pending_locks(self) -> None:
         for node_id, lock_params in self.pending_loads.values():
             self.cache.dec_lock_ref(node_id, lock_params)
         self.pending_loads.clear()
+        self._load_request_handles.clear()
         for pending in self.pending_offloads:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, False
@@ -592,14 +661,32 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 
-    def release_request(self, rid: str) -> None:
+    def release_request(
+        self, handle: CacheRequestHandle, *, cancel_load: bool = True
+    ) -> None:
+        rid = handle.rid
+        current = self._request_handles.get(rid)
+        if current is not None and current != handle:
+            return
         self.hit_markers.pop(rid, None)
         # TODO: Roll back the published tree and component state atomically before
         # canceling; otherwise the tree may retain device slots that were never loaded.
-        if self.cache_linker.cancel_queued_load(rid):
+        owns_load = self._load_request_handles.get(rid, handle) == handle
+        if cancel_load and owns_load and self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
+            self._load_request_handles.pop(rid, None)
             self.cache.dec_lock_ref(node_id, lock_params)
+        if current is not None:
+            self.cache_linker.release_request_context(handle)
+            self._request_handles.pop(rid)
+
+    def _release_request_contexts(self) -> None:
+        for handle in self._request_handles.values():
+            self.cache_linker.release_request_context(handle)
+        self._request_handles.clear()
 
     def close(self) -> None:
         self.cache_linker.close()
+        self.hit_markers.clear()
         self._release_pending_locks()
+        self._release_request_contexts()

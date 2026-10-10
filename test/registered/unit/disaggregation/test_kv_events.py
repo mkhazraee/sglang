@@ -326,6 +326,25 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual(decoded["cache_salt"], "tenant-a")
         self.assertEqual(decoded["session_id"], "session-a")
 
+    def test_ownership_is_optional_and_round_trips_as_a_named_field(self):
+        for event in (
+            self._event(),
+            BlockRemoved(block_hashes=[123], medium=StorageMedium.CPU),
+            AllBlocksCleared(),
+        ):
+            with self.subTest(event=type(event).__name__):
+                payload = msgspec.msgpack.encode(event)
+                self.assertNotIn("ownership", msgspec.msgpack.decode(payload))
+                self.assertIsNone(
+                    msgspec.msgpack.decode(payload, type=type(event)).ownership
+                )
+                owned = msgspec.structs.replace(event, ownership="kvcr")
+                payload = msgspec.msgpack.encode(owned)
+                self.assertEqual(msgspec.msgpack.decode(payload)["ownership"], "kvcr")
+                self.assertEqual(
+                    msgspec.msgpack.decode(payload, type=type(event)).ownership, "kvcr"
+                )
+
     def test_one_decoder_reads_a_mixed_batch(self):
         batch = KVEventBatch(
             ts=1.0,

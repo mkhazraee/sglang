@@ -289,15 +289,17 @@ class BlockStored(KVCacheEvent):
     # Session that triggered this store. Attribution only: the blocks may be
     # shared with other sessions, and the hash does not depend on it.
     session_id: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    ownership: Optional[str] = None
 
 
 class KVEventBatch(EventBatch):

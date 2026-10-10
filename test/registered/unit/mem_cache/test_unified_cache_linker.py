@@ -18,14 +18,26 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    StorageMedium,
+)
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+    EvictParams,
     InitLoadBackParams,
+    InsertParams,
     InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -47,6 +59,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -112,6 +125,18 @@ class _MappingRecorder:
         self.mapping.append((full.clone(), swa.clone()))
 
 
+class _ContextLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.contexts = {}
+
+    def set_request_context(self, handle, kv_hints):
+        self.contexts[handle] = kv_hints
+
+    def release_request_context(self, handle):
+        self.contexts.pop(handle)
+
+
 class _FakeExternalTreeCore:
     def __init__(self, nodes=None, offload_transfers=None):
         self.enable_external_cache_linker = False
@@ -152,6 +177,10 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "attn_cp_group": None,
+        "attn_tp_group": None,
+        "tp_world_size": 1,
+        "_all_reduce_attn_groups": lambda value, op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -782,7 +811,8 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     assert hit_pages == 2
 
 
-def test_async_offload_pins_node_until_completion():
+@pytest.mark.parametrize("success", [False, True])
+def test_async_offload_pins_node_until_completion(success):
     linker = _FakeLinker()
     lock_params = object()
     locks = []
@@ -812,13 +842,176 @@ def test_async_offload_pins_node_until_completion():
     assert node.write_through_pending_id == node_id
     assert not unlocks
 
-    linker.completed_offloads.append(False)
+    linker.completed_offloads.append(success)
     completed = wrapper.take_completed_offloads(finish_count=1)
     wrapper.commit_completed_offloads(completed)
 
-    assert not node.external_cache_stored
+    assert node.external_cache_stored == success
     assert node.write_through_pending_id is None
     assert unlocks == [(node_id, lock_params)]
+
+
+@pytest.mark.parametrize("success", [False, True])
+@pytest.mark.parametrize("events_enabled", [False, True])
+@pytest.mark.parametrize("remote_removal", [False, True])
+def test_local_inventory_tracks_storage_removal_after_tree_eviction(
+    success, events_enabled, remote_removal, monkeypatch
+):
+    hashes = ["1" * 64, "2" * 64]
+    root = SimpleNamespace(parent=None, hash_value=[])
+    node = SimpleNamespace(
+        id=7,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+        key=RadixKey(array("q", [1, 2, 3, 4])),
+        hash_value=hashes,
+        parent=root,
+    )
+    core = _FakeExternalTreeCore(
+        {node.id: node}, [PoolTransfer(name=PoolName.KV, keys=hashes)]
+    )
+    core._node_arena = core.nodes
+    core._external_cache_event_hashes = {}
+    core.node_by_id = core.nodes.__getitem__
+    core.kv_events = KVCacheEventRecorder(enabled=events_enabled, page_size=2)
+    core.record_external_cache_store = lambda node_ids, medium: (
+        UnifiedTreeCore.record_external_cache_store(core, node_ids, medium)
+    )
+    core.remove_external_cache_storage = lambda keys, medium, **kwargs: (
+        UnifiedTreeCore.remove_external_cache_storage(core, keys, medium, **kwargs)
+    )
+    backend = _FakeLinker()
+    backend.local_storage_medium = StorageMedium.CPU
+    removals = []
+    backend.pop_storage_removals = lambda: list(removals)
+    cache = _cache_for_wrapper(
+        tree_core=core,
+        inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=object),
+        dec_lock_ref=lambda *args: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.offload_nodes([node.id])
+    assert core.kv_events.take() == []
+    backend.completed_offloads.append(success)
+    completed = wrapper.take_completed_offloads(1)
+    assert core.kv_events.take() == []
+    wrapper.commit_completed_offloads(completed)
+    stored = core.kv_events.take()
+    assert bool(stored) == (success and events_enabled)
+    if stored:
+        assert isinstance(stored[0], BlockStored)
+        assert stored[0].medium == StorageMedium.CPU
+
+    if remote_removal:
+        cache.tp_world_size = 2
+        cache.tp_group = object()
+        cache._all_reduce_attn_groups = lambda value, op: value.fill_(1)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: 2)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda gathered, local, **kwargs: gathered.__setitem__(
+                slice(None), [local, hashes[:1]]
+            ),
+        )
+        wrapper.drain_storage_removals()
+        assert not node.external_cache_stored
+        assert core.kv_events.take() == []
+        assert set(core._external_cache_event_hashes) == (
+            set(hashes) if stored else set()
+        )
+
+    removals.append(hashes[0])
+    wrapper.drain_storage_removals()
+    assert not node.external_cache_stored
+    removed = core.kv_events.take()
+    if stored:
+        assert isinstance(removed[0], BlockRemoved)
+        assert removed[0].block_hashes == stored[0].block_hashes[:1]
+    else:
+        assert removed == []
+
+    core.nodes.clear()
+    removals[:] = [hashes[1]]
+    wrapper.drain_storage_removals()
+    removed = core.kv_events.take()
+    if stored:
+        assert removed[0].block_hashes == stored[0].block_hashes[1:]
+        assert removed[0].medium == StorageMedium.CPU
+    else:
+        assert removed == []
+
+
+@pytest.mark.parametrize("tree_core_backend", ["python", "rust"])
+@pytest.mark.parametrize("linker_mode", ["none", "default", "owned"])
+def test_take_events_tags_only_linker_local_storage(
+    tree_core_backend, linker_mode, monkeypatch
+):
+    monkeypatch.setattr(shared_cache_suite, "get_device", lambda: "cpu")
+    cache, allocator, _ = build_fixture(
+        CacheConfig(page_size=1, kv_size=8, max_context_len=8),
+        enable_kv_cache_events=True,
+        tree_core_backend=tree_core_backend,
+    )
+    cache.take_events()
+    inserted = cache.insert(
+        InsertParams(key=RadixKey(array("q", [1, 2])), value=allocator.alloc(2))
+    )
+    core = cache.tree_core
+    core.record_external_cache_store([inserted.last_device_node], StorageMedium.CPU)
+    hashes = core.get_hash_values(inserted.last_device_node)
+    core.remove_external_cache_storage(hashes[:1], StorageMedium.CPU)
+    cache.evict(EvictParams(num_tokens=2))
+    core.kv_events.record_all_cleared()
+    if linker_mode != "none":
+        backend = _FakeLinker()
+        assert backend.local_storage_ownership is None
+        backend.local_storage_medium = StorageMedium.CPU
+        if linker_mode == "owned":
+            backend.local_storage_ownership = "kvcr"
+        cache.init_cache_linker(backend)
+    owner = "kvcr" if linker_mode == "owned" else None
+    events = cache.take_events()
+    assert [
+        (type(event), getattr(event, "medium", None), event.ownership)
+        for event in events
+    ] == [
+        (BlockStored, StorageMedium.GPU, None),
+        (BlockStored, StorageMedium.CPU, owner),
+        (BlockRemoved, StorageMedium.CPU, owner),
+        (BlockRemoved, StorageMedium.GPU, None),
+        (AllBlocksCleared, None, None),
+    ]
+    cache.reset()
+    assert cache.take_events() == [AllBlocksCleared()]
+    core.remove_external_cache_storage(hashes[1:], StorageMedium.CPU)
+    assert cache.take_events() == [
+        BlockRemoved(
+            block_hashes=events[1].block_hashes[1:],
+            medium=StorageMedium.CPU,
+            ownership=owner,
+        )
+    ]
+
+
+@pytest.mark.parametrize("event_type", [BlockStored, BlockRemoved])
+def test_kv_event_coalescing_preserves_ownership(event_type):
+    recorder = KVCacheEventRecorder(enabled=True, page_size=1)
+    for index, owner in enumerate([None, "kvcr", "kvcr", None]):
+        fields = dict(block_hashes=[index], medium=StorageMedium.CPU, ownership=owner)
+        if event_type is BlockStored:
+            fields.update(
+                parent_block_hash=index - 1 if index else None,
+                token_ids=[index],
+                block_size=1,
+                lora_id=None,
+            )
+        recorder.enqueue(event_type(**fields))
+    assert [(event.block_hashes, event.ownership) for event in recorder.take()] == [
+        ([0], None),
+        ([1, 2], "kvcr"),
+        ([3], None),
+    ]
 
 
 def test_offload_skips_node_already_stored_by_tree_core():
@@ -879,12 +1072,78 @@ def test_release_request_cancels_queued_load():
     wrapper.pending_loads["rid"] = (7, lock_params)
     linker.queued_loads["rid"] = [object()]
 
-    wrapper.release_request("rid")
+    wrapper.release_request(CacheRequestHandle("rid", 0))
 
     assert wrapper.hit_markers == {}
     assert wrapper.pending_loads == {}
     assert "rid" not in linker.queued_loads
     assert unlocks == [(7, lock_params)]
+
+
+@pytest.mark.parametrize("cancel_load", [False, True])
+@pytest.mark.parametrize("finish", ["drain", "reset", "close"])
+def test_request_release_notifies_backend_without_unpinning_load(cancel_load, finish):
+    backend = _ContextLinker()
+    unlocked = []
+    cache = _cache_for_wrapper(dec_lock_ref=lambda *args: unlocked.append(args))
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    handle = CacheRequestHandle("rid", 1)
+    wrapper._request_handles[handle.rid] = handle
+    backend.set_request_context(handle, {"scope": "first"})
+    wrapper.pending_loads[handle.rid] = (7, object())
+    wrapper._load_request_handles[handle.rid] = handle
+
+    wrapper.release_request(handle, cancel_load=cancel_load)
+
+    assert backend.contexts == {}
+    assert not unlocked
+    if finish == "drain":
+        backend.completed_loads.append([handle.rid])
+        wrapper.drain_loads(1)
+    else:
+        getattr(wrapper, finish)()
+    assert len(unlocked) == 1
+    assert wrapper._request_handles == {}
+
+
+def test_successful_request_releases_linker_context():
+    released = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        release_request=lambda handle, **kwargs: released.append((handle, kwargs))
+    )
+    handle = CacheRequestHandle("rid", 2)
+
+    cache.finish(handle, CacheRequestOutcome.SUCCESS)
+
+    assert released == [(handle, {"cancel_load": False})]
+
+
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize("session_claims", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_normal_release_cleans_context_only_for_finished_request(
+    finished, session_claims, checkpointed
+):
+    backend = _ContextLinker()
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), backend)
+    handle = CacheRequestHandle("rid", 0)
+    wrapper._request_handles[handle.rid] = handle
+    backend.set_request_context(handle, None)
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.cache_controller = None
+    cache.linker = wrapper
+    cache._components_tuple = ()
+    cache.session = SimpleNamespace(try_cache_finished_req=lambda req: session_claims)
+    req = SimpleNamespace(
+        rid="rid", cache_request_handle=handle, finished=lambda: finished
+    )
+
+    assert cache.claim_kv_row(req) == session_claims
+    if not session_claims:
+        assert backend.contexts == {handle: None}
+        cache.on_release(req, checkpointed=checkpointed)
+    assert backend.contexts == ({} if finished else {handle: None})
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -1011,6 +1270,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        drain_storage_removals=lambda: None,
     )
 
     reduce_calls = 0
@@ -1180,13 +1440,78 @@ def test_linker_filters_request_relative_swa_from_lookup(
         best_match_node=0,
     )
     matched = wrapper.match(
-        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="match"), result
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(
+            rid="match",
+            cache_request_handle=CacheRequestHandle("match", 0),
+            kv_hints=None,
+        ),
+        result,
     )
     assert matched.host_hit_length == 4
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOOKUP,
     ]
     swa.build_external_linker_transfer.assert_not_called()
+
+
+@pytest.mark.parametrize("queued_load", [False, True])
+def test_lookup_context_is_passed_before_lookup_and_isolated_by_attempt(
+    full_linker_component, queued_load
+):
+    backend = _ContextLinker()
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(
+            _components_tuple=(full_linker_component,),
+            page_size=2,
+            tree_core=SimpleNamespace(
+                enable_external_cache_linker=False, is_eagle=False
+            ),
+            inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=object),
+            dec_lock_ref=lambda *args: None,
+        ),
+        backend,
+    )
+    action = KvHintAction(
+        action_id="pin", action_type="pin", action_version="1", payload={"scope": [1]}
+    )
+    hints = KvHintsEnvelope(
+        protocol_version="1", message_id="message", actions=[action]
+    )
+    handle = CacheRequestHandle("same-rid", 0)
+    req = SimpleNamespace(rid=handle.rid, cache_request_handle=handle, kv_hints=hints)
+    seen = []
+    backend.lookup = lambda rid, transfers: seen.append(backend.contexts[handle]) or [1]
+    key = RadixKey(array("q", [1, 2]))
+    result = MatchResult(
+        device_prefix_len=0, last_device_node=0, last_host_node=0, best_match_node=0
+    )
+
+    assert wrapper.match(key, req, result).host_hit_length == 2
+    assert seen == [hints]
+    if queued_load:
+        wrapper._queue_load(handle.rid, 7, [object()])
+    else:
+        wrapper.release_request(handle, cancel_load=False)
+        assert backend.contexts == {}
+        assert not wrapper.has_hit(handle.rid)
+
+    new_handle = CacheRequestHandle(handle.rid, 1)
+    req.cache_request_handle = new_handle
+    req.kv_hints = None
+    backend.lookup = lambda rid, transfers: []
+    wrapper.match(key, req, result)
+    assert backend.contexts == {new_handle: None}
+    wrapper.release_request(handle)
+    assert backend.contexts == {new_handle: None}
+    wrapper.release_request(new_handle)
+    assert backend.contexts == {}
+    if queued_load:
+        assert handle.rid in backend.queued_loads
+        assert handle.rid in wrapper.pending_loads
+        backend.completed_loads.append([handle.rid])
+        wrapper.drain_loads(1)
+        assert backend.contexts == {}
 
 
 @pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
@@ -1256,8 +1581,13 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
     ],
 )
+@pytest.mark.parametrize("loaded_path_is_stored", [True, False])
 def test_linker_load_preserves_swa_boundaries(
-    full_linker_component, swa_req_ring, previous_boundary, expected_boundary
+    full_linker_component,
+    swa_req_ring,
+    previous_boundary,
+    expected_boundary,
+    loaded_path_is_stored,
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
@@ -1298,7 +1628,9 @@ def test_linker_load_preserves_swa_boundaries(
         resolve_node_handle=lambda node_id: SimpleNamespace(id=0),
         prefix_device_indices=lambda req: torch.empty(0, dtype=torch.int64),
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    backend = _FakeLinker()
+    backend.loaded_path_is_stored = loaded_path_is_stored
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
         prefix_key=RadixKey(array("q", [1, 2, 3, 4])),
         tail_hashes=["a", "b"],
@@ -1330,7 +1662,10 @@ def test_linker_load_preserves_swa_boundaries(
         cache.insert.call_args.args[0].get_evicted_seqlen(ComponentType.SWA)
         == expected_boundary
     )
-    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    if loaded_path_is_stored:
+        cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    else:
+        cache.tree_core.mark_external_cache_stored_path.assert_not_called()
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]

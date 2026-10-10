@@ -2617,6 +2617,60 @@ fn failed_external_offload_preserves_independently_confirmed_state() {
 }
 
 #[test]
+fn external_linker_inventory_survives_device_eviction() {
+    let mut tc = core();
+    tc.enable_kv_cache_events = true;
+    tc.set_enable_external_cache_linker(true).unwrap();
+    tc.insert(&insert_params(&vec![1, 2], &[10, 11]));
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2]))
+        .best_match_node_id;
+    let idx = tc.arena.resolve(leaf).unwrap();
+    let hashes = tc.arena.node(idx).hash_value.clone().unwrap();
+    tc.take_events();
+    tc.mark_external_linker_offload_pending(leaf).unwrap();
+    tc.finish_external_linker_offload(&[leaf], leaf, true)
+        .unwrap();
+    tc.record_external_cache_store(&[leaf], StorageMedium::Cpu)
+        .unwrap();
+    assert!(matches!(
+        tc.take_events().as_slice(),
+        [KvCacheEvent::BlockStored {
+            medium: StorageMedium::Cpu,
+            ..
+        }]
+    ));
+
+    tc.remove_external_cache_storage(&hashes[..1], Some(StorageMedium::Cpu));
+    assert!(!tc.arena.node(idx).external_cache_stored);
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockRemoved {
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
+            medium: StorageMedium::Cpu,
+        }]
+    );
+    let (dropped, _) = tc.drop_subtree_no_host(leaf).unwrap();
+    assert!(dropped);
+    assert!(tc.take_events().iter().all(|event| !matches!(
+        event,
+        KvCacheEvent::BlockRemoved {
+            medium: StorageMedium::Cpu,
+            ..
+        }
+    )));
+    tc.reset();
+    tc.remove_external_cache_storage(&hashes[1..], Some(StorageMedium::Cpu));
+    assert_eq!(
+        tc.take_events(),
+        vec![KvCacheEvent::BlockRemoved {
+            block_hashes: vec![crate::node::hash_str_to_int64(&hashes[1])],
+            medium: StorageMedium::Cpu,
+        }]
+    );
+}
+
+#[test]
 fn external_linker_path_validation_is_atomic() {
     let mut tc = core();
     tc.insert(&insert_params(&vec![1], &[10]));

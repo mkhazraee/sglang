@@ -43,6 +43,9 @@ class Client:
         self.next_handle = 0
         self.polls = 0
         self.fail_poll = False
+        self.no_evict = {}
+        self.claims = set()
+        self.released = []
 
     def submit_hint(self, hint, request_id=None):
         self.hints[request_id] = hint
@@ -56,8 +59,15 @@ class Client:
     def deliver(self, blocks, request_id=None):
         return self._submit("deliver", blocks, request_id)
 
-    def deposit(self, blocks):
+    def deposit(self, blocks, no_evict=False):
+        self.no_evict[self.next_handle + 1] = no_evict
         return self._submit("deposit", blocks, None)
+
+    def release(self, handles):
+        results = [(handle, handle in self.claims) for handle in handles]
+        self.claims.difference_update(handles)
+        self.released.extend(handles)
+        return results
 
     def _submit(self, kind, blocks, request_id):
         self.next_handle += 1
@@ -68,9 +78,13 @@ class Client:
 
     def complete(self, handle, success=True):
         blocks = next(call[2] for call in self.calls if call[0] == handle)
-        self.results.append(
-            (handle, {key: SimpleNamespace(success=success) for key in blocks})
-        )
+        result = {}
+        for key in blocks:
+            claim = (handle, key) if success and self.no_evict.get(handle) else None
+            if claim is not None:
+                self.claims.add(claim)
+            result[key] = SimpleNamespace(success=success, release_handle=claim)
+        self.results.append((handle, result))
 
     def poll_completed(self):
         self.polls += 1
@@ -242,7 +256,7 @@ class TestKVCRDirectLinker(CustomTestCase):
             eventually(lambda: len(idle_waits) >= 2)
         self.assertEqual(self.linker.pop_completed_load(), ["a", "b"])
         self.assertTrue(self.linker.pop_completed_offload())
-        self.assertEqual(len(self.client.calls), 7)
+        self.assertEqual(len(self.client.calls), 9)
         self.assertTrue(active_waits)
         self.assertEqual(set(active_waits), {0})
         self.assertTrue(all(wait is not None and wait > 0 for wait in idle_waits))
@@ -265,20 +279,116 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertTrue(all(call[1] == "deliver" for call in self.client.calls))
         for handle in [1, 3, 2]:
             self.client.complete(handle)
-        eventually(lambda: len(self.client.calls) == 4)
+        eventually(lambda: len(self.client.calls) == 6)
         self.assertEqual(self.client.calls[-1][1], "deposit")
-        self.client.complete(4)
+        for handle in [6, 4, 5]:
+            self.client.complete(handle)
         eventually(lambda: self.linker.num_completed_offloads() == 1)
         self.assertTrue(self.linker.pop_completed_offload())
         before = self.client.polls
         eventually(lambda: self.client.polls > before + 2)
-        self.assertEqual(len(self.client.calls), 4)
+        self.assertEqual(len(self.client.calls), 6)
         second_ready.ready = True
-        eventually(lambda: len(self.client.calls) == 5)
+        eventually(lambda: len(self.client.calls) == 9)
         self.assertEqual(self.client.calls[-1][1], "deposit")
-        self.client.complete(5)
+        for handle in [7, 9, 8]:
+            self.client.complete(handle)
         eventually(lambda: self.linker.num_completed_offloads() == 1)
         self.assertTrue(self.linker.pop_completed_offload())
+
+    def test_offload_window_retains_claims_until_success_or_failed_work_drains(self):
+        """Layer deposits overlap; failure stops new work without releasing live sources."""
+        for failed in (False, True):
+            start, released = len(self.client.calls) + 1, len(self.client.released)
+            with (
+                self.subTest(failed=failed),
+                patch.object(
+                    self.linker.layout, "mappings", wraps=self.linker.layout.mappings
+                ) as mappings,
+            ):
+                self.linker.offload(self.transfer(["a", "a"]))
+                eventually(lambda: len(self.client.calls) == start + 3)
+                self.assertEqual(
+                    [call.args[1] for call in mappings.call_args_list], [0, 1]
+                )
+                self.assertEqual(
+                    list(self.client.no_evict.values())[-4:],
+                    [True, False, False, False],
+                )
+                self.assertTrue(
+                    all(
+                        len(refs) == 1
+                        for call in self.client.calls[-4:]
+                        for refs in call[2].values()
+                    )
+                )
+                self.client.complete(start)
+                eventually(lambda: len(self.client.calls) == start + 4)
+                self.assertTrue(self.client.claims)
+                if failed:
+                    self.runtime.events.append(
+                        SimpleNamespace(state="uncertain", op_handle=-9)
+                    )
+                self.client.complete(start + 3, success=not failed)
+                for offset in (2, 1, 4):
+                    self.client.complete(start + offset)
+                if failed:
+                    eventually(lambda: not self.client.results)
+                    self.assertEqual(len(self.client.calls), start + 4)
+                    self.assertEqual(self.linker.num_completed_offloads(), 0)
+                    self.assertEqual(len(self.client.released), released)
+                    self.runtime.events.append(
+                        SimpleNamespace(state="quiesced", op_handle=-9)
+                    )
+                else:
+                    eventually(lambda: len(self.client.calls) == start + 5)
+                    self.client.complete(start + 5)
+                eventually(lambda: self.linker.num_completed_offloads() == 1)
+                self.assertEqual(self.linker.pop_completed_offload(), not failed)
+                self.assertFalse(self.client.claims)
+                self.assertEqual(len(self.client.released), released + 1)
+
+    def test_offload_retains_keys_first_appearing_in_a_later_layer(self):
+        """Sparse pools need their own first claim, including mixed old/new key batches."""
+        from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
+
+        base = self.group.entries[0]
+        sparse = DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=base.components,
+            layer_mapping={1: 1, 2: 2},
+            page_size=1,
+            rows_are_pages=True,
+        )
+        self.linker.layout = KVCRLayout(
+            DevicePoolGroup([base, sparse], 3, 1),
+            model_name="dummy",
+            endpoint_name="test",
+        )
+        self.linker.offload(
+            self.transfer(["a"])
+            + [PoolTransfer(PoolName.SWA, keys=["b"], device_indices=torch.tensor([0]))]
+        )
+        eventually(lambda: len(self.client.calls) == 3)
+        self.assertEqual(list(self.client.no_evict.values()), [True, True, False])
+        for handle in [2, 3, 1]:
+            self.client.complete(handle)
+        eventually(lambda: self.linker.num_completed_offloads() == 1)
+        self.assertTrue(self.linker.pop_completed_offload())
+        self.assertFalse(self.client.claims)
+        self.assertEqual(len(self.client.released), 3)
+
+    def test_offload_rejects_missing_release_acknowledgements(self):
+        self.linker.offload(self.transfer(["a"]))
+        eventually(lambda: len(self.client.calls) == 3)
+        with patch.object(self.client, "release", return_value=[]):
+            for handle in [1, 2, 3]:
+                self.client.complete(handle)
+            eventually(lambda: self.linker._fatal is not None)
+        self.assertEqual(self.linker.num_completed_offloads(), 0)
+        self.assertTrue(self.client.claims)
 
     def test_hint_scope_cleanup_waits_for_accepted_load(self):
         a, b = CacheRequestHandle("a", 1), CacheRequestHandle("b", 2)
@@ -475,8 +585,9 @@ class TestKVCRDirectLinker(CustomTestCase):
 
     def test_removal_waits_for_its_offload_ack_but_not_unrelated_offloads(self):
         self.linker.offload(self.transfer(["a"]))
-        eventually(lambda: len(self.client.calls) == 1)
-        self.client.complete(1)
+        eventually(lambda: len(self.client.calls) == 3)
+        for handle in [3, 2, 1]:
+            self.client.complete(handle)
         eventually(lambda: self.linker.num_completed_offloads() == 1)
         key = self.linker.layout.encode_key("a", PoolName.KV)
         other_key = self.linker.layout.encode_key("b", PoolName.KV)

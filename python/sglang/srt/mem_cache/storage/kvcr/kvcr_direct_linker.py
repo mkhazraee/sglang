@@ -106,6 +106,8 @@ class _Offload:
     dependencies: tuple[_Load, ...]
     keys: set[bytes]
     work: object = None
+    retained_keys: set[bytes] = field(default_factory=set)
+    claims: list = field(default_factory=list)
     active: int = 0
     exhausted: bool = False
     success: bool = True
@@ -404,6 +406,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         )
         return True
 
+    def _offload_work(self, transfers):
+        for layer in range(self.pool_group.num_layers):
+            yield from self.layout.mappings(transfers, layer)
+
     def _fail_batch(self, batch, error):
         batch.error = error
         batch.exhausted = True
@@ -445,6 +451,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if isinstance(owner, _Batch):
                 owner.remaining[operation.layer] -= 1
                 self._complete_layer(owner, operation.layer)
+            else:
+                owner.claims.extend(
+                    entry.release_handle
+                    for entry in operation.result.values()
+                    if entry.release_handle is not None
+                )
             del self._operations[handle]
         deliveries = sum(
             isinstance(op.owner, _Batch) for op in self._operations.values()
@@ -499,17 +511,27 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 return
             if any(load.error for load in task.dependencies):
                 task.success, task.exhausted = False, True
-            if not task.exhausted and not task.active:
+            while not task.exhausted and task.active < 4:
                 if task.work is None:
-                    task.work = iter(self.layout.mappings(task.transfers))
+                    task.work = self._offload_work(task.transfers)
                 blocks = next(task.work, None)
                 if blocks is None:
                     task.exhausted = True
                 else:
-                    handle = self._runtime.client.deposit(blocks)
+                    # Retain early pieces until every layer has drained.
+                    retain = not task.retained_keys.issuperset(blocks)
+                    handle = self._runtime.client.deposit(blocks, no_evict=retain)
+                    if retain:
+                        task.retained_keys.update(blocks)
                     self._operations[handle] = _Operation(task, set(blocks))
                     task.active += 1
             if task.exhausted and not task.active:
+                if task.claims:
+                    released = self._runtime.client.release(task.claims)
+                    if len(released) != len(task.claims) or not all(
+                        success for _, success in released
+                    ):
+                        raise RuntimeError("KVCR offload claim release failed")
                 self._completed_offloads.put((task.success, task.keys))
                 self._offloads.popleft()
 

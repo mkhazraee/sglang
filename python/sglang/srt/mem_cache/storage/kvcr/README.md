@@ -2,16 +2,16 @@
 
 The KVCR linker transfers registered GPU KV pages directly to and from KVCR's
 local DRAM or a hinted remote KVCR peer. It uses `deposit`, `query`, and `deliver`,
-with at most four layer deliveries outstanding. Its owner thread continuously
-polls KVCR, including while idle, so peer requests and transfer lifecycle events
-keep progressing. Framework source-pin requests are declined; peers can retrieve
-completed deposits in KVCR-owned DRAM.
+with up to four layer deliveries and four layer deposits outstanding. Its owner
+thread continuously polls KVCR, including while idle, so peer requests and transfer
+lifecycle events keep progressing. Framework source-pin requests are declined;
+peers can retrieve completed deposits in KVCR-owned DRAM.
 
 ## Setup
 
 Install KVCR with its NIXL/UCX dependencies in the serving environment. Use the
-public API from KVCR revision `8a91e20` or a compatible revision that includes
-the local-copy timeout lifecycle fix.
+public API with concurrent named-piece deposits (`21fb6ae`) and the local-copy
+timeout lifecycle fix (`8a91e20`).
 
 DRAM additions and removals carry `ownership="kvcr"` in the existing KV event
 stream. Engine GPU events and cache clears retain the default ownership. Dynamo

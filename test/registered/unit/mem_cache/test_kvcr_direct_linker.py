@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from collections import Counter, deque
+from concurrent.futures import Future
 from copy import copy
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -269,6 +270,42 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertTrue(active_waits)
         self.assertEqual(set(active_waits), {0})
         self.assertTrue(all(wait is not None and wait > 0 for wait in idle_waits))
+
+    def test_offload_yields_to_commands_and_serializes_duplicate_destinations(self):
+        """Queued commands precede offload work; repeated keys need separate deposits."""
+        polling, resume = threading.Event(), threading.Event()
+        poll = self.client.poll_completed
+
+        def gated_poll():
+            if self.linker._offloads:
+                polling.set()
+                resume.wait(5)
+            return poll()
+
+        with patch.object(self.client, "poll_completed", side_effect=gated_poll):
+            try:
+                self.linker.offload(self.transfer(["a", "a"]))
+                self.assertTrue(polling.wait(5))
+                with patch.object(self.linker, "_call", side_effect=AssertionError):
+                    self.assertEqual(self.linker.start_layer_wise_loading(), -1)
+                command = Future()
+                self.linker._commands.put((lambda: len(self.client.calls), (), command))
+                resume.set()
+                self.assertEqual(command.result(timeout=5), 0)
+                eventually(lambda: len(self.client.calls) == 1)
+                polls = self.client.polls
+                eventually(lambda: self.client.polls > polls + 2)
+                self.assertEqual(len(self.client.calls), 1)
+                self.client.complete(1)
+                eventually(lambda: len(self.client.calls) == 2)
+                refs = [next(iter(call[2].values())) for call in self.client.calls]
+                self.assertEqual([len(group) for group in refs], [3, 3])
+                self.assertEqual([group[0].element_index for group in refs], [0, 1])
+                self.client.complete(2)
+            finally:
+                resume.set()
+        eventually(lambda: self.linker.num_completed_offloads() == 1)
+        self.assertTrue(self.linker.pop_completed_offload())
 
     def test_offload_waits_for_producer_and_earlier_queued_load(self):
         self.linker.load("a", self.transfer(["a"]))
@@ -568,6 +605,9 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertFalse(waiter.is_alive())
         self.assertEqual(errors, ["KVCR linker is closed"])
         self.linker.release_request_context(handle)
+
+        with self.assertRaisesRegex(RuntimeError, "KVCR linker is closed"):
+            self.linker.start_layer_wise_loading()
 
     def test_batches_complete_in_admission_order_and_idle_source_keeps_polling(self):
         self.linker.load("a", self.transfer(["a"]))

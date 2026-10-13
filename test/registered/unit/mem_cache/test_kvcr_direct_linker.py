@@ -1,5 +1,6 @@
 """Direct GPU delivery ordering and ownership, with a controlled KVCR boundary."""
 
+import json
 import threading
 import time
 import unittest
@@ -86,6 +87,9 @@ class Runtime:
         self.removals = {}
         self.closed = False
         self.close_error = False
+
+    def log_stats(self):
+        pass
 
     def close(self):
         if self.close_error:
@@ -552,13 +556,22 @@ class TestKVCRRuntime(CustomTestCase):
                 raise self.guard_error
             if self.constructor_error is not None:
                 raise self.constructor_error
-            return SimpleNamespace(
+            instance = SimpleNamespace(
                 config=config,
                 bindings=bindings,
                 backends=backends,
                 guard_config=guard_config,
                 close=close,
+                stats=bindings.stats_factory() if config.enable_telemetry else None,
             )
+
+            def get_stats():
+                stats = instance.stats
+                instance.stats = bindings.stats_factory() if stats is not None else None
+                return stats
+
+            instance.get_stats = get_stats
+            return instance
 
         modules = {
             name: ModuleType(name)
@@ -611,6 +624,10 @@ class TestKVCRRuntime(CustomTestCase):
         self.assertEqual(guard.compatibility_digest, self.layout.namespace)
         self.assertIsNone(runtime.client.backends.local_dram)
         self.assertFalse(runtime._buffers)
+        self.assertFalse(runtime.client.config.enable_telemetry)
+        self.assertIsNone(runtime.client.bindings.stats_factory)
+        with patch.object(runtime.client, "get_stats", side_effect=AssertionError):
+            runtime.log_stats(force=True)
         configured = self.make_runtime(
             kvcr_service_socket_path="/tmp/kvcr.sock",
             guard_index=4,
@@ -639,6 +656,62 @@ class TestKVCRRuntime(CustomTestCase):
                 )
                 self.assertEqual(len(self.attempts), 2 if cause else 1)
                 self.assertIsNone(self.attempts[-1])
+
+    def test_telemetry_logs_labelled_interval_aggregates_and_flushes_on_close(self):
+        module = "sglang.srt.mem_cache.storage.kvcr.runtime"
+        for guard_error in (None, self.guard_error):
+            with self.subTest(guard=guard_error is None):
+                self.guard_error = guard_error
+                with patch(module + ".time.monotonic", return_value=100) as clock:
+                    runtime = self.make_runtime(enable_telemetry=True)
+                    stats = runtime.client.stats
+                    for duration in (0.1, 0.3):
+                        stats.observe_histogram(
+                            "kvcr_duration_seconds",
+                            duration,
+                            ("deposit_submit", "submitted"),
+                        )
+                    stats.observe_histogram(
+                        "kvcr_duration_seconds", 0.2, ("deposit_submit", "failed")
+                    )
+                    stats.increase_counter(
+                        "kvcr_deposit_duplicate_pieces", 2, ("pending",)
+                    )
+                    stats.increase_counter(
+                        "kvcr_deposit_duplicate_pieces", 3, ("pending",)
+                    )
+                    stats.set_gauge("kvcr_state", 3, ("in_flight_ops",))
+                    stats.set_gauge("kvcr_state", 1, ("in_flight_ops",))
+                    clock.return_value = 104
+                    with self.assertNoLogs(module, level="INFO"):
+                        runtime.log_stats()
+                    clock.return_value = 105
+                    with self.assertLogs(module, level="INFO") as logs:
+                        runtime.log_stats()
+                    record = logs.records[0].getMessage()
+                    self.assertIn("rank=2 interval_s=5.000000", record)
+                    values = json.loads(record.split("stats=", 1)[1])
+                    prefix = "kvcr_duration_seconds[deposit_submit,submitted]"
+                    self.assertEqual(values[prefix + ".count"], 2)
+                    self.assertAlmostEqual(values[prefix + ".sum"], 0.4)
+                    self.assertEqual(values[prefix + ".max"], 0.3)
+                    self.assertEqual(
+                        values["kvcr_duration_seconds[deposit_submit,failed].count"], 1
+                    )
+                    self.assertEqual(
+                        values["kvcr_deposit_duplicate_pieces[pending].counter"], 5
+                    )
+                    self.assertEqual(values["kvcr_state[in_flight_ops].gauge"], 1)
+                    runtime.client.stats.increase_counter(
+                        "kvcr_source_fast_path", 1, ("hit",)
+                    )
+                    clock.return_value = 106
+                    with self.assertLogs(module, level="INFO") as logs:
+                        runtime.close()
+                    values = json.loads(
+                        logs.records[0].getMessage().split("stats=", 1)[1]
+                    )
+                    self.assertEqual(values, {"kvcr_source_fast_path[hit].counter": 1})
 
     def test_refused_or_uncertain_guard_claim_never_falls_back(self):
         for error in (
@@ -685,11 +758,21 @@ class TestKVCRRuntime(CustomTestCase):
         self.assertFalse(runtime.removals)
 
     def test_failed_close_retains_mappings_until_success(self):
-        runtime = self.make_runtime()
+        runtime = self.make_runtime(enable_telemetry=True)
         buffers = tuple(runtime._buffers)
         self.close_error = True
         try:
-            with self.assertRaisesRegex(RuntimeError, "DMA is still active"):
+            with (
+                patch.object(
+                    runtime.client,
+                    "get_stats",
+                    side_effect=RuntimeError("stats failed"),
+                ),
+                self.assertLogs(
+                    "sglang.srt.mem_cache.storage.kvcr.runtime", level="WARNING"
+                ),
+                self.assertRaisesRegex(RuntimeError, "DMA is still active"),
+            ):
                 runtime.close()
             self.assertTrue(all(not buffer.closed for buffer in buffers))
         finally:
@@ -721,6 +804,7 @@ class TestKVCRRuntime(CustomTestCase):
             {"guard_index": -1},
             {"guard_index": True},
             {"compatibility_digest": ""},
+            {"enable_telemetry": "true"},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.runtime_type(self.layout, options, rank=2)

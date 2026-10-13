@@ -246,6 +246,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if self._fatal is None and not self._closed:
                 try:
                     self._progress()
+                    self._runtime.log_stats()
                 except BaseException as error:
                     self._fatal = error
                     for batch in self._batches:

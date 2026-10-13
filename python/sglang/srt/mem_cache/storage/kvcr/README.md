@@ -57,6 +57,7 @@ are strict; unknown names fail startup.
 | `nixl_port` | `20500` | Base NIXL port; the global rank is added. |
 | `operation_timeout_ms` | `1000` | Positive operation deadline in milliseconds. |
 | `abandon_timeout_ms` | `5000` | Failure-reporting deadline, at least twice the operation timeout. |
+| `enable_telemetry` | `false` | Log aggregate KVCR timings, counters, and state at INFO every five seconds and on close/reset. |
 
 ## Guard memory and fallback
 

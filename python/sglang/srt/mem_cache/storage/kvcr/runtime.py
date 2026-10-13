@@ -1,13 +1,49 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import math
 import mmap
 import socket
-from collections import deque
+import time
+from collections import Counter, deque
 
 logger = logging.getLogger(__name__)
+
+
+class _TelemetryStats:
+    """Bounded interval aggregates recorded on the KVCR API owner thread."""
+
+    def __init__(self):
+        self.counters = Counter()
+        self.gauges = {}
+        self.histograms = {}
+
+    def increase_counter(self, name, value, labelvalues=()):
+        self.counters[name, labelvalues] += value
+
+    def set_gauge(self, name, value, labelvalues=()):
+        self.gauges[name, labelvalues] = value
+
+    def observe_histogram(self, name, value, labelvalues=()):
+        key = name, labelvalues
+        count, total, maximum = self.histograms.get(key, (0, 0, value))
+        self.histograms[key] = count + 1, total + value, max(maximum, value)
+
+    def is_empty(self):
+        return not (self.counters or self.gauges or self.histograms)
+
+    def reduce(self):
+        values = {
+            f"{name}[{','.join(labels)}].{kind}": value
+            for kind, metrics in (("counter", self.counters), ("gauge", self.gauges))
+            for (name, labels), value in metrics.items()
+        }
+        for (name, labels), summary in self.histograms.items():
+            for kind, value in zip(("count", "sum", "max"), summary):
+                values[f"{name}[{','.join(labels)}].{kind}"] = value
+        return values
 
 
 class KVCRRuntime:
@@ -25,6 +61,7 @@ class KVCRRuntime:
             "nixl_port": 20500,
             "operation_timeout_ms": 1000,
             "abandon_timeout_ms": 5000,
+            "enable_telemetry": False,
         }
         unknown = options.keys() - defaults.keys()
         if unknown:
@@ -32,6 +69,8 @@ class KVCRRuntime:
         config = defaults | options
         if type(rank) is not int or rank < 0:
             raise ValueError("KVCR rank must be a nonnegative integer")
+        if type(config["enable_telemetry"]) is not bool:
+            raise ValueError("KVCR enable_telemetry must be a boolean")
         guard_socket = config["kvcr_service_socket_path"]
         if guard_socket is not None and (
             not isinstance(guard_socket, str) or not guard_socket
@@ -90,6 +129,9 @@ class KVCRRuntime:
         from kvcr.types import CacheTier, KVCRStartupError
 
         self._layout = layout
+        self._rank = rank
+        self._telemetry_enabled = config["enable_telemetry"]
+        self._last_stats_log = time.monotonic()
         self.events = deque()
         self.removals = {}
         self._buffers = []
@@ -114,6 +156,7 @@ class KVCRRuntime:
                 nixl_listen_port=config["nixl_port"],
                 operation_timeout_ms=config["operation_timeout_ms"],
                 abandon_timeout_ms=config["abandon_timeout_ms"],
+                enable_telemetry=self._telemetry_enabled,
             )
             bindings = KVCRBindings(
                 request_pin=self._decline_pin,
@@ -128,6 +171,7 @@ class KVCRRuntime:
                 key_adapter=self,
                 inventory_sink=inventory,
                 on_resilience_event=self.events.append,
+                stats_factory=_TelemetryStats if self._telemetry_enabled else None,
             )
             if guard_socket is not None:
                 guard = KVCRGuardConfig(
@@ -204,9 +248,34 @@ class KVCRRuntime:
             raise ValueError("Unknown KVCR layout key")
         return int(decoded[1][:16], 16)
 
+    def log_stats(self, *, force=False):
+        if not self._telemetry_enabled:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_stats_log
+        if not force and elapsed < 5:
+            return
+        self._last_stats_log = now
+        try:
+            stats = self.client.get_stats()
+            if stats is not None and not stats.is_empty():
+                logger.info(
+                    "KVCR telemetry rank=%d interval_s=%.6f stats=%s",
+                    self._rank,
+                    elapsed,
+                    json.dumps(stats.reduce(), sort_keys=True),
+                )
+        except Exception:
+            # Optional diagnostics must not prevent transfer progress or shutdown.
+            self._telemetry_enabled = False
+            logger.warning(
+                "KVCR telemetry logging disabled after failure", exc_info=True
+            )
+
     def close(self) -> None:
         if self.client is None:
             raise RuntimeError("KVCR startup did not establish safe resource ownership")
+        self.log_stats(force=True)
         self.client.close()
         self._close_buffers()
 

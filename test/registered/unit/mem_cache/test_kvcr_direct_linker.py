@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -262,6 +263,47 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertEqual(set(active_waits), {0})
         self.assertTrue(all(wait is not None and wait > 0 for wait in idle_waits))
 
+    def test_offload_yields_to_commands_and_between_deposits(self):
+        """Ready offload work must not bypass commands or fill its window in one turn."""
+        polling, resume = threading.Event(), threading.Event()
+        poll, deposit = self.client.poll_completed, self.client.deposit
+        deposit_polls = []
+
+        def gated_poll():
+            if self.linker._offloads:
+                polling.set()
+                resume.wait(5)
+            return poll()
+
+        def prepare(function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def submit(*args, **kwargs):
+            deposit_polls.append(self.client.polls)
+            return deposit(*args, **kwargs)
+
+        with (
+            patch.object(self.client, "poll_completed", side_effect=gated_poll),
+            patch.object(self.linker._preparer, "submit", side_effect=prepare),
+            patch.object(self.client, "deposit", side_effect=submit),
+        ):
+            try:
+                self.linker.offload(self.transfer(["a"]))
+                self.assertTrue(polling.wait(5))
+                command = self.linker._send(lambda: len(self.client.calls), wait=True)
+                resume.set()
+                self.assertEqual(command.result(timeout=5), 0)
+                eventually(lambda: len(self.client.calls) == 3)
+                self.assertEqual(len(set(deposit_polls)), 3)
+            finally:
+                resume.set()
+        for handle in (1, 2, 3):
+            self.client.complete(handle)
+        eventually(lambda: self.linker.num_completed_offloads() == 1)
+        self.assertTrue(self.linker.pop_completed_offload())
+
     def test_offload_waits_for_producer_and_earlier_queued_load(self):
         self.linker.load("a", self.transfer(["a"]))
         first_ready, second_ready, load_ready = Event(), Event(), Event()
@@ -421,6 +463,7 @@ class TestKVCRDirectLinker(CustomTestCase):
             try:
                 results.append(self.linker.pop_completed_offload())
                 results.append(self.linker.pop_storage_removals())
+                results.append(self.linker.start_layer_wise_loading())
                 self.linker.release_request_context(handle)
                 results.append(self.linker.offload(self.transfer(["later"], 2)))
                 key = self.linker.layout.encode_key("later", PoolName.KV)
@@ -448,7 +491,7 @@ class TestKVCRDirectLinker(CustomTestCase):
                 waiter.start()
                 self.assertTrue(returned.wait(5), "scheduler waited for deposit")
                 self.assertEqual(errors, [])
-                self.assertEqual(results, [True, [], True, []])
+                self.assertEqual(results, [True, [], -1, True, []])
             finally:
                 prepared.set()
                 submitted.set()
@@ -615,6 +658,7 @@ class TestKVCRDirectLinker(CustomTestCase):
             self.linker.num_completed_loads,
             self.linker.num_completed_offloads,
             self.linker.pop_storage_removals,
+            self.linker.start_layer_wise_loading,
         ):
             with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
                 poll()
@@ -736,6 +780,9 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertFalse(waiter.is_alive())
         self.assertEqual(errors, ["KVCR linker is closed"])
         self.linker.release_request_context(handle)
+
+        with self.assertRaisesRegex(RuntimeError, "KVCR linker is closed"):
+            self.linker.start_layer_wise_loading()
 
     def test_batches_complete_in_admission_order_and_idle_source_keeps_polling(self):
         self.linker.load("a", self.transfer(["a"]))

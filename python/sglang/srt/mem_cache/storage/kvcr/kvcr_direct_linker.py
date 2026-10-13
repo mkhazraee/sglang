@@ -382,6 +382,12 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return False
 
     def start_layer_wise_loading(self):
+        if self._closed:
+            raise RuntimeError("KVCR linker is closed")
+        self._raise_if_failed()
+        # Synchronous load/start/reset calls keep this queue visible to the scheduler.
+        if not self._queued:
+            return -1
         ready = torch.cuda.Event()
         ready.record()
         return self._call(self._start, ready)
@@ -532,6 +538,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if any(load.error for load in task.dependencies):
                 task.success, task.exhausted = False, True
             while not task.exhausted and task.active < 4:
+                if not self._commands.empty():
+                    return
                 if task.work is None:
                     task.work = self._offload_work(task.transfers)
                 if task.preparation is None:
@@ -556,6 +564,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                         task.retained_keys.update(blocks)
                     self._operations[handle] = _Operation(task, set(blocks))
                     task.active += 1
+                    # Service commands and yield between deposits, keeping four in flight.
+                    break
             if task.exhausted and task.preparation is not None:
                 task.preparation.cancel()
                 if not task.preparation.done():

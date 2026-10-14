@@ -271,6 +271,63 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertEqual(set(active_waits), {0})
         self.assertTrue(all(wait is not None and wait > 0 for wait in idle_waits))
 
+    def test_offload_snapshots_before_preparation_and_holds_physical_keys(self):
+        """Pending producers must not force row reads or permit reused indices/keys."""
+        from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
+
+        base = self.group.entries[0]
+        indexer = copy(base)
+        indexer.name = PoolName.INDEXER
+        self.linker.layout = KVCRLayout(
+            DevicePoolGroup([base, indexer], 3, 1),
+            model_name="dummy",
+            endpoint_name="test",
+        )
+        ready = Event()
+        ready.ready = False
+        transfers = self.transfer(["before"], 1)
+        keys = {
+            self.linker.layout.encode_key("before", name)
+            for name in (PoolName.KV, PoolName.INDEXER)
+        }
+        resolve = self.linker.layout.prepare
+
+        def prepare_off_thread(*args, **kwargs):
+            self.assertEqual(threading.get_ident(), self.linker._thread.ident)
+            return resolve(*args, **kwargs)
+
+        with (
+            patch("torch.cuda.Event", return_value=ready),
+            patch.object(
+                self.linker.layout, "prepare", side_effect=prepare_off_thread
+            ) as prepare,
+        ):
+            self.assertTrue(self.linker.offload(transfers))
+            transfers[0].device_indices.fill_(7)
+            transfers[0].keys[0] = "after"
+            self.runtime.removals.update({key: "before" for key in keys})
+            self.assertEqual(self.linker.pop_storage_removals(), [])
+            self.linker._call(lambda: None)
+            prepare.assert_not_called()
+            ready.ready = True
+            eventually(lambda: len(self.client.calls) == 1)
+        blocks = self.client.calls[0][2]
+        self.assertEqual(set(blocks), keys)
+        for refs in blocks.values():
+            self.assertEqual(len(refs), 3)
+            self.assertEqual({ref.element_index for ref in refs}, {1})
+        self.client.complete(1)
+        eventually(lambda: self.linker.num_completed_offloads() == 1)
+        self.assertTrue(self.linker.pop_completed_offload())
+        self.assertCountEqual(self.linker.pop_storage_removals(), ["before", "before"])
+        with patch.object(
+            self.linker.layout, "prepare", side_effect=ValueError("bad indices")
+        ):
+            self.assertTrue(self.linker.offload(self.transfer(["bad"])))
+            eventually(lambda: self.linker.num_completed_offloads() == 1)
+            self.assertFalse(self.linker.pop_completed_offload())
+            self.assertIsNone(self.linker._fatal)
+
     def test_offload_yields_to_commands_and_serializes_duplicate_destinations(self):
         """Queued commands precede offload work; repeated keys need separate deposits."""
         polling, resume = threading.Event(), threading.Event()

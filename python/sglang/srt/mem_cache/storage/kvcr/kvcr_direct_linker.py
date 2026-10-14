@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import Counter, deque
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
 
 import msgspec
@@ -510,20 +510,42 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             yield layer, None, None
 
     def offload(self, transfers):
-        prepared = self.layout.prepare(transfers, allow_partial=True)
+        # Row conversion copies indices to CPU and waits for queued GPU work.
+        # Snapshot on the producer stream; prepare only after its event is ready.
+        keys = self.layout.encoded_keys(transfers, allow_partial=True)
+        if not keys:
+            return False
+        transfers = tuple(
+            replace(
+                transfer,
+                keys=list(transfer.keys) if transfer.keys is not None else None,
+                device_indices=(
+                    transfer.device_indices.clone()
+                    if isinstance(transfer.device_indices, torch.Tensor)
+                    else transfer.device_indices
+                ),
+                host_indices=(
+                    transfer.host_indices.clone()
+                    if isinstance(transfer.host_indices, torch.Tensor)
+                    else transfer.host_indices
+                ),
+            )
+            for transfer in transfers
+        )
         ready = torch.cuda.Event()
         ready.record()
-        return self._call(self._offload, prepared, ready)
+        return self._call(self._offload, transfers, ready, keys)
 
-    def _offload(self, prepared, ready):
-        if not prepared:
-            return False
-        keys = {key for transfer in prepared for key in transfer.keys}
+    def _offload(self, transfers, ready, keys):
         self._unacknowledged_keys.update(keys)
         self._offloads.append(
-            _Offload(prepared, ready, tuple(self._loads.values()), keys)
+            _Offload(transfers, ready, tuple(self._loads.values()), keys)
         )
         return True
+
+    def _prepare_offload(self, transfers):
+        prepared = self.layout.prepare(list(transfers), allow_partial=True)
+        return self.layout.mappings(prepared)
 
     def _fail_batch(self, batch, error):
         batch.error = error
@@ -632,14 +654,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 if not self._commands.empty():
                     return
                 if task.work is None:
-                    task.work = iter(self.layout.mappings(task.transfers))
-                blocks = next(task.work, None)
-                if blocks is None:
-                    task.exhausted = True
-                else:
-                    handle = self._runtime.client.deposit(blocks)
-                    self._operations[handle] = _Operation(task, set(blocks))
-                    task.active += 1
+                    try:
+                        task.work = iter(self._prepare_offload(task.transfers))
+                    except Exception:
+                        logger.exception("KVCR offload preparation failed")
+                        task.success, task.exhausted = False, True
+                if not task.exhausted:
+                    blocks = next(task.work, None)
+                    if blocks is None:
+                        task.exhausted = True
+                    else:
+                        handle = self._runtime.client.deposit(blocks)
+                        self._operations[handle] = _Operation(task, set(blocks))
+                        task.active += 1
             if task.exhausted and not task.active:
                 self._completed_offloads.put((task.success, task.keys))
                 self._offloads.popleft()

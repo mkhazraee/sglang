@@ -880,6 +880,86 @@ class TestKVCRDirectLinker(CustomTestCase):
         )
         self.assertEqual(linker.lookup("a", self.transfer(["a"])), [1])
 
+    def ranked_linker(self, options, *, replicated=True, cp=1, pp=1, nnodes=1):
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        params = SimpleNamespace(**vars(self.params))
+        params.attn_tp_cache_group = object()
+        params.attn_cp_size, params.pp_size = cp, pp
+        self.group.rank_replicated = replicated
+        runtime = Runtime()
+        with (
+            get_context().override_server_args(
+                tp_size=8,
+                nnodes=nnodes,
+                hicache_storage_backend_extra_config=json.dumps(options),
+            ),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(torch.distributed, "get_world_size", return_value=4),
+            patch.object(
+                torch.distributed,
+                "get_rank",
+                side_effect=lambda group=None: (
+                    2 if group is params.attn_tp_cache_group else 6
+                ),
+            ),
+        ):
+            linker = KVCRDirectLinker(
+                None, params, components=set(), runtime_factory=lambda *a, **kw: runtime
+            )
+        self.addCleanup(linker.close)
+        return linker, runtime.client
+
+    def test_replicated_source_rank_routing_is_opt_in(self):
+        for enabled, endpoint, expected in (
+            (False, "tcp://source:25000", "tcp://source:25000"),
+            (True, "tcp://[::1]:25000", "tcp://[::1]:25002"),
+            (True, "tcp://source:65535", "tcp://source:65535"),
+        ):
+            options = {"replicated_source_rank_routing": True} if enabled else {}
+            with self.subTest(options=options, endpoint=endpoint):
+                linker, client = self.ranked_linker(options)
+                hint = {
+                    "actions": [
+                        {
+                            "action_type": action,
+                            "payload": {"source_control_endpoint": endpoint},
+                        }
+                        for action in ("kv.other", "kv.fetch")
+                    ]
+                }
+                linker.set_request_context(CacheRequestHandle("a", 0), hint)
+                sent = next(iter(client.hints.values()))
+                self.assertEqual(
+                    [
+                        action["payload"]["source_control_endpoint"]
+                        for action in sent["actions"]
+                    ],
+                    [endpoint, expected],
+                )
+                self.assertEqual(
+                    hint["actions"][1]["payload"]["source_control_endpoint"], endpoint
+                )
+                linker.close()
+
+    def test_replicated_source_rank_routing_rejects_unsupported_configuration(self):
+        for option, topology in (
+            ("true", {}),
+            (True, {"replicated": False}),
+            (True, {"cp": 2}),
+            (True, {"pp": 2}),
+            (True, {"nnodes": 2}),
+        ):
+            with (
+                self.subTest(option=option, topology=topology),
+                self.assertRaises(ValueError),
+            ):
+                self.ranked_linker(
+                    {"replicated_source_rank_routing": option}, **topology
+                )
+
     def test_unaddressed_remote_shard_hints_do_not_admit_failed_deliveries(self):
         from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
             KVCRDirectLinker,

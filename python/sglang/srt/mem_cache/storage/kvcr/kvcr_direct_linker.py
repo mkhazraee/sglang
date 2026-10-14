@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
 
 import msgspec
@@ -417,24 +417,43 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             yield layer, None, None
 
     def offload(self, transfers):
-        prepared = self.layout.prepare(transfers, allow_partial=True)
-        if not prepared:
+        # Row conversion copies indices to CPU and waits for queued GPU work.
+        # Snapshot on the producer stream; prepare only after its event is ready.
+        keys = self.layout.encoded_keys(transfers, allow_partial=True)
+        if not keys:
             return False
+        transfers = tuple(
+            replace(
+                transfer,
+                keys=list(transfer.keys) if transfer.keys is not None else None,
+                device_indices=(
+                    transfer.device_indices.clone()
+                    if isinstance(transfer.device_indices, torch.Tensor)
+                    else transfer.device_indices
+                ),
+                host_indices=(
+                    transfer.host_indices.clone()
+                    if isinstance(transfer.host_indices, torch.Tensor)
+                    else transfer.host_indices
+                ),
+            )
+            for transfer in transfers
+        )
         ready = torch.cuda.Event()
         ready.record()
-        keys = {key for transfer in prepared for key in transfer.keys}
-        self._send(self._offload, prepared, ready, keys)
+        self._send(self._offload, transfers, ready, keys)
         self._unacknowledged_keys.update(keys)
         return True
 
-    def _offload(self, prepared, ready, keys):
+    def _offload(self, transfers, ready, keys):
         self._offloads.append(
-            _Offload(prepared, ready, tuple(self._loads.values()), keys)
+            _Offload(transfers, ready, tuple(self._loads.values()), keys)
         )
 
     def _offload_work(self, transfers):
+        prepared = self.layout.prepare(list(transfers), allow_partial=True)
         for layer in range(self.pool_group.num_layers):
-            yield from self.layout.mappings(transfers, layer)
+            yield from self.layout.mappings(prepared, layer)
 
     def _fail_batch(self, batch, error):
         batch.error = error

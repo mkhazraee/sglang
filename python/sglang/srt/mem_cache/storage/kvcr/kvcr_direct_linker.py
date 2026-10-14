@@ -17,7 +17,7 @@ from queue import Empty, Queue
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import StorageMedium, parse_advertisable_tcp
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -119,6 +119,25 @@ class _Operation:
     result: object = None
 
 
+def _offset_source_ports(hints, offset):
+    """Offset the first fetch action in an explicitly homogeneous deployment."""
+    for action in hints.get("actions", ()):
+        if not isinstance(action, dict) or action.get("action_type") != "kv.fetch":
+            continue
+        payload = action.get("payload")
+        if isinstance(payload, dict):
+            endpoint = payload.get("source_control_endpoint")
+            address = (
+                parse_advertisable_tcp(endpoint) if isinstance(endpoint, str) else None
+            )
+            if address is not None and address[1] + offset <= 65535:
+                payload["source_control_endpoint"] = (
+                    f"tcp://{address[0]}:{address[1] + offset}"
+                )
+        break
+    return hints
+
+
 class KVCRDirectLinker(UnifiedCacheLinker):
     loaded_path_is_stored = False
     local_storage_medium = StorageMedium.CPU
@@ -168,6 +187,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         options, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
+        route_replicated = options.pop("replicated_source_rank_routing", False)
+        if type(route_replicated) is not bool:
+            raise ValueError("KVCR replicated_source_rank_routing must be a boolean")
+        if route_replicated and (
+            not self.pool_group.rank_replicated
+            or not self._remote_hints_supported
+            or get_parallel().nnodes != 1
+        ):
+            raise ValueError(
+                "KVCR replicated_source_rank_routing requires replicated pools "
+                "with single-node CP1/PP1 serving"
+            )
+        # Opt-in asserts identical source attention-TP widths and rank-zero base ports.
+        self._source_rank_offset = tp_rank if route_replicated else 0
         self._make_runtime = lambda: (runtime_factory or KVCRRuntime)(
             self.layout, options, rank=rank
         )
@@ -274,6 +307,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._scopes[handle] = scope
         self._request_scopes[handle.rid] = scope
         if hints is not None and self._remote_hints_supported:
+            if self._source_rank_offset:
+                hints = _offset_source_ports(hints, self._source_rank_offset)
             try:
                 self._runtime.client.submit_hint(hints, request_id=scope)
             except ValueError as error:

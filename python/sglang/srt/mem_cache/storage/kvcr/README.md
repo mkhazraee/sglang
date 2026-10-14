@@ -59,6 +59,7 @@ are strict; unknown names fail startup.
 | `abandon_timeout_ms` | `5000` | Failure-reporting deadline, at least twice the operation timeout. |
 | `enable_telemetry` | `false` | Log aggregate KVCR timings, counters, and state at INFO every five seconds and on close/reset. |
 | `trailing_capacity_divisor` | `1` | Positive integer reducing SWA-derived pools' page capacity in in-process DRAM; each retains at least one page. Guard capacities are configured separately. |
+| `replicated_source_rank_routing` | `false` | Opt in to fetching replicated KV from the corresponding source rank; requires the source topology described below. |
 
 ## Guard memory and fallback
 
@@ -86,6 +87,14 @@ and reserve more of the budget for full-prefix pools. Set
 `"kvcr_service_socket_path": null` to select this mode explicitly.
 
 ## Operational constraints
+
+Enable `replicated_source_rank_routing` only when every hinted source is a
+single-node worker with the same attention-TP size, advertises its attention
+group's rank-zero control endpoint, and uses consecutive control ports. The
+target must also use single-node, CP1/PP1 serving with rank-replicated pools.
+Each target attention-TP rank then adds its rank to the advertised source port.
+Leave this disabled for unknown or mixed source topologies; the original
+advertised endpoint is used unchanged by default.
 
 DRAM and GPU registrations remain owned until successful KVCR shutdown. A
 shutdown error retains the mappings; an uncertain transfer keeps its affected

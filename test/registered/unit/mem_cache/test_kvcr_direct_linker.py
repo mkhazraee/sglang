@@ -48,6 +48,7 @@ class Client:
         self.no_evict = {}
         self.claims = set()
         self.released = []
+        self.fetch_data = {}
 
     def submit_hint(self, hint, request_id=None):
         self.hints[request_id] = hint
@@ -64,6 +65,15 @@ class Client:
     def deposit(self, blocks, no_evict=False):
         self.no_evict[self.next_handle + 1] = no_evict
         return self._submit("deposit", blocks, None)
+
+    def fetch(self, keys, request_id=None, expected_layout=None):
+        handle = self._submit("fetch", dict.fromkeys(keys, expected_layout), request_id)
+        self.no_evict[handle] = True
+        self.complete(
+            handle,
+            success={key: self.fetch_data.get(key) == expected_layout for key in keys},
+        )
+        return handle
 
     def release(self, handles):
         results = [(handle, handle in self.claims) for handle in handles]
@@ -82,10 +92,11 @@ class Client:
         blocks = next(call[2] for call in self.calls if call[0] == handle)
         result = {}
         for key in blocks:
-            claim = (handle, key) if success and self.no_evict.get(handle) else None
+            ok = success if isinstance(success, bool) else success[key]
+            claim = (handle, key) if ok and self.no_evict.get(handle) else None
             if claim is not None:
                 self.claims.add(claim)
-            result[key] = SimpleNamespace(success=success, release_handle=claim)
+            result[key] = SimpleNamespace(success=ok, release_handle=claim)
         self.results.append((handle, result))
 
     def poll_completed(self):
@@ -757,6 +768,101 @@ class TestKVCRDirectLinker(CustomTestCase):
             SimpleNamespace(value="DRAM"),
         )
         self.assertEqual(self.linker.lookup("a", transfers), [])
+
+    def trailing_transfers(self):
+        from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
+            KVCRDirectLinker,
+        )
+
+        self.assertFalse(self.linker.requires_lookup_confirmation)
+        self.linker.close()
+        base = self.group.entries[0]
+        swa = copy(base)
+        swa.name = swa.indices_from_pool = PoolName.SWA
+        self.runtime = Runtime()
+        with patch(
+            "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker.resolve_hybrid_device_pool_group",
+            return_value=DevicePoolGroup([base, swa], 3, 1),
+        ):
+            self.linker = KVCRDirectLinker(
+                None,
+                self.params,
+                components=set(),
+                runtime_factory=lambda *a, **kw: self.runtime,
+            )
+        self.addCleanup(self.linker.close)
+        self.client = self.runtime.client
+        self.assertTrue(self.linker.requires_lookup_confirmation)
+        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        return [
+            PoolTransfer(PoolName.KV, keys=["a", "b", "c"]),
+            PoolTransfer(
+                PoolName.SWA, keys=["c"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            ),
+        ]
+
+    def test_trailing_confirmation_retains_only_complete_state_through_load(self):
+        transfers = self.trailing_transfers()
+        encode = self.linker.layout.encode_key
+        labels = list(self.linker.layout._labels[PoolName.SWA][0])
+        for pool in (PoolName.KV, PoolName.SWA):
+            for key in "abc":
+                self.client.status[encode(key, pool)] = (
+                    SimpleNamespace(value="HIT"),
+                    SimpleNamespace(value="DRAM"),
+                )
+        self.client.fetch_data[encode("b", PoolName.SWA)] = labels
+        self.client.fetch_data[encode("c", PoolName.SWA)] = labels[:1]
+        self.assertEqual(self.linker.lookup("a", transfers), [1, 2, 3])
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
+        self.assertTrue(self.linker.confirm_lookup("a", transfers, 2))
+        transfers[1].keys, transfers[1].device_indices = ["b"], torch.tensor([1])
+        self.assertTrue(self.linker.load("a", [transfers[1]]))
+        self.linker.release_request_context(CacheRequestHandle("a", 0))
+        self.linker.start_layer_wise_loading()
+        eventually(lambda: len(self.client.calls) == 5)
+        self.client.complete(3, success=False)
+        self.client.complete(4)
+        eventually(lambda: len(self.linker._operations) == 1)
+        self.assertTrue(self.client.claims)
+        self.assertEqual(self.linker.num_completed_loads(), 0)
+        self.client.complete(5)
+        eventually(lambda: self.linker.num_completed_loads() == 1)
+        self.assertFalse(self.client.claims)
+
+    def test_trailing_confirmation_reuses_overlap_and_discards_unused_claims(self):
+        transfers = self.trailing_transfers()
+        transfers[1].keys = ["b", "c"]
+        labels = list(self.linker.layout._labels[PoolName.SWA][0])
+        a, b, c = [self.linker.layout.encode_key(k, PoolName.SWA) for k in "abc"]
+        self.client.fetch_data.update({b: labels, c: labels})
+        self.assertTrue(self.linker.confirm_lookup("a", transfers, 3))
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 2))
+        self.assertEqual({claim[1] for claim in self.client.claims}, {b})
+        self.assertEqual(set(self.client.calls[-1][2]), {a})
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 1))
+        self.assertEqual(len(self.client.calls), 2)
+        self.assertFalse(self.client.claims)
+        self.client.fetch_data[a] = labels
+        self.linker.lookup("a", transfers)
+        self.assertTrue(self.linker.confirm_lookup("a", transfers, 1))
+        self.linker.confirm_lookup("a", [], 0)
+        self.assertFalse(self.client.claims)
+        self.assertTrue(self.linker.confirm_lookup("a", transfers, 1))
+        self.linker.release_request_context(CacheRequestHandle("a", 0))
+        self.linker._call(lambda: None)
+        self.assertFalse(self.client.claims)
+
+    def test_trailing_confirmation_rechecks_after_reset(self):
+        transfers = self.trailing_transfers()
+        key = self.linker.layout.encode_key("c", PoolName.SWA)
+        self.client.fetch_data[key] = list(self.linker.layout._labels[PoolName.SWA][0])
+        self.assertTrue(self.linker.confirm_lookup("a", transfers, 3))
+        with patch.object(self.linker, "_make_runtime", return_value=Runtime()):
+            self.linker.reset()
+        self.assertTrue(self.runtime.closed)
+        self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
 
     def test_failure_stops_unsubmitted_work_and_fails_dependent_offload(self):
         for i in range(3):

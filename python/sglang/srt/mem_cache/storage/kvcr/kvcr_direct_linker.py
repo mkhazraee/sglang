@@ -82,6 +82,7 @@ class _Load:
     rid: str
     scope: str | None
     transfers: tuple
+    claims: list = field(default_factory=list)
     done: bool = False
     error: BaseException | None = None
 
@@ -115,8 +116,14 @@ class _Offload:
 
 
 @dataclass
+class _Confirm:
+    claims: dict
+    active: int = 0
+
+
+@dataclass
 class _Operation:
-    owner: _Batch | _Offload
+    owner: _Batch | _Offload | _Confirm
     keys: set[bytes]
     layer: int | None = None
     result: object = None
@@ -154,6 +161,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             page_size=params.page_size,
             params=params,
             components=components,
+        )
+        self.requires_lookup_confirmation = any(
+            entry.indices_from_pool == PoolName.SWA for entry in self.pool_group.entries
         )
         tp_rank, tp_size, rank = 0, get_parallel().tp_size, 0
         if torch.distributed.is_initialized():
@@ -225,6 +235,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._hazards = set()
         self._scopes = {}
         self._request_scopes = {}
+        self._lookup_claims = {}
         self._released_scopes = set()
         self._fatal = None
         self._closed = False
@@ -346,6 +357,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _release_context(self, handle):
         scope = self._scopes.pop(handle, None)
         if scope is not None:
+            self._discard_lookup(scope)
             if self._request_scopes.get(handle.rid) == scope:
                 self._request_scopes.pop(handle.rid)
             self._released_scopes.add(scope)
@@ -367,6 +379,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return self._call(self._lookup, rid, keys, prepared)
 
     def _lookup(self, rid, keys, prepared):
+        self._discard_lookup(self._request_scopes.get(rid))
         valid = set(range(1, len(keys) + 1))
         for transfer in prepared:
             encoded = [self.layout.encode_key(key, transfer.name) for key in keys]
@@ -396,6 +409,64 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             }
         return sorted(valid)
 
+    def _release_claims(self, claims):
+        if claims:
+            released = self._runtime.client.release(claims)
+            if len(released) != len(claims) or not all(ok for _, ok in released):
+                raise RuntimeError("KVCR claim release failed")
+
+    def _discard_lookup(self, scope):
+        claims = self._lookup_claims.get(scope, {})
+        self._release_claims([claim for claim in claims.values() if claim is not None])
+        self._lookup_claims.pop(scope, None)
+
+    def confirm_lookup(self, rid, transfers, hit_pages):
+        prepared = self.layout.group.resolve_transfers(transfers) if hit_pages else ()
+        keys = next((tuple(t.keys) for t in transfers if t.name == PoolName.KV), ())
+        return self._call(self._confirm_lookup, rid, keys, prepared, hit_pages)
+
+    def _confirm_lookup(self, rid, keys, prepared, hit_pages):
+        scope = self._request_scopes.get(rid)
+        if not hit_pages:
+            self._discard_lookup(scope)
+            return False
+        windows = {
+            t.name: [
+                self.layout.encode_key(key, t.name)
+                for key in keys[max(0, hit_pages - max(1, len(t.keys))) : hit_pages]
+            ]
+            for t in prepared
+            if t.hit_policy != PoolHitPolicy.ALL_PAGES
+        }
+        if not windows:
+            return True
+        if scope is None:
+            raise RuntimeError("KVCR trailing confirmation requires a request context")
+        required = {key for window in windows.values() for key in window}
+        claims = self._lookup_claims.setdefault(scope, {})
+        stale = claims.keys() - required
+        self._release_claims([claims[key] for key in stale if claims[key] is not None])
+        for key in stale:
+            del claims[key]
+        # Keep only this candidate's window; None remembers misses while retrying.
+        owner = _Confirm(claims)
+        for name, window in windows.items():
+            pending = [key for key in window if key not in claims]
+            if not pending:
+                continue
+            labels = [
+                label for component in self.layout._labels[name] for label in component
+            ]
+            handle = self._runtime.client.fetch(
+                pending, request_id=scope, expected_layout=labels
+            )
+            self._operations[handle] = _Operation(owner, set(pending))
+            owner.active += 1
+        while owner.active:
+            self._progress()
+            time.sleep(0)
+        return all(claims.get(key) is not None for key in required)
+
     def load(self, rid, transfers):
         prepared = self.layout.prepare(
             transfers, allow_partial=True, allow_missing_kv=True
@@ -403,11 +474,19 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return self._call(self._load, rid, prepared)
 
     def _load(self, rid, prepared):
+        scope = self._request_scopes.get(rid)
         if not prepared:
+            self._discard_lookup(scope)
             return False
         if rid in self._loads:
             raise RuntimeError(f"KVCR load already accepted for {rid}")
-        load = _Load(rid, self._request_scopes.get(rid), prepared)
+        claims = self._lookup_claims.pop(scope, {})
+        load = _Load(
+            rid,
+            scope,
+            prepared,
+            [claim for claim in claims.values() if claim is not None],
+        )
         self._loads[rid] = load
         self._queued.append(load)
         return True
@@ -516,7 +595,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     self._fail_batch(
                         operation.owner, RuntimeError(f"KVCR delivery {handle} failed")
                     )
-                else:
+                elif isinstance(operation.owner, _Offload):
                     operation.owner.success = False
                     operation.owner.exhausted = True
         # Lifecycle handles may name internal copies rather than public ops.
@@ -531,6 +610,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             if isinstance(owner, _Batch):
                 owner.remaining[operation.layer] -= 1
                 self._complete_layer(owner, operation.layer)
+            elif isinstance(owner, _Confirm):
+                owner.claims.update(dict.fromkeys(operation.keys))
+                owner.claims.update(
+                    (key, entry.release_handle)
+                    for key, entry in operation.result.items()
+                    if entry.success
+                )
             else:
                 owner.claims.extend(
                     entry.release_handle
@@ -579,6 +665,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 batch.error is None,
             )
             for load in batch.loads:
+                self._release_claims(load.claims)
                 load.done, load.error = True, batch.error
                 del self._loads[load.rid]
             self._completed_loads.put([load.rid for load in batch.loads])
@@ -626,12 +713,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     return
                 task.preparation = None
             if task.exhausted and not task.active:
-                if task.claims:
-                    released = self._runtime.client.release(task.claims)
-                    if len(released) != len(task.claims) or not all(
-                        success for _, success in released
-                    ):
-                        raise RuntimeError("KVCR offload claim release failed")
+                self._release_claims(task.claims)
                 self._completed_offloads.put((task.success, task.keys))
                 self._offloads.popleft()
 
@@ -694,6 +776,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._hazards.clear()
         self._scopes.clear()
         self._request_scopes.clear()
+        self._lookup_claims.clear()
         self._released_scopes.clear()
         self._completed_loads = Queue()
         self._completed_offloads = Queue()
@@ -713,6 +796,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _close(self):
         self._preparer.shutdown(wait=True, cancel_futures=True)
         self._runtime.close()
+        self._lookup_claims.clear()
         for batch in self._batches:
             self._fail_batch(batch, RuntimeError("KVCR linker closed"))
         with self._command_lock:

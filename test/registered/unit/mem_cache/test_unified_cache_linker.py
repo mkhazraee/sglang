@@ -796,19 +796,95 @@ class TestUnifiedCacheLinkerTreeCoreRustBackend(
     tree_core_backend = "rust"
 
 
-def test_restorable_prefix_intersects_sparse_rank_results():
-    remote_mask = torch.tensor([0, 0, 1, 0, 0], dtype=torch.int)
+@pytest.mark.parametrize("confirmed,expected", [(None, 2), ({1}, 1), (set(), 0)])
+def test_restorable_prefix_intersects_sparse_rank_results(confirmed, expected):
+    """Rejecting the longest shared boundary must retry a shorter shared one."""
+    remote_mask = torch.tensor([0, 1, 1, 1, 0], dtype=torch.int)
+    probes = []
+
+    def confirm(pages):
+        probes.append(pages)
+        return True
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
-        mask.copy_(torch.minimum(mask, remote_mask))
+        if mask.numel() > 1:
+            mask.copy_(torch.minimum(mask, remote_mask))
+        else:
+            mask[0] &= int(probes[-1] in confirmed)
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=intersect_remote_mask)
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
-    hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
+    hit_pages = wrapper._sync_restorable_prefix(
+        [1, 2, 4],
+        num_pages=4,
+        device_hit_pages=0,
+        confirm=None if confirmed is None else confirm,
+    )
+    assert hit_pages == expected
+    assert probes == (
+        [] if confirmed is None else [2, 1] + ([0] if not expected else [])
+    )
 
-    assert hit_pages == 2
+
+@pytest.mark.parametrize(
+    "path", ["match_rejected", "allocation_failure", "device_hit", "empty_load"]
+)
+def test_lookup_claims_released_when_device_load_is_unnecessary(
+    full_linker_component, monkeypatch, path
+):
+    """Rejected or superseded loads must not retain lookup claims or cache hits."""
+    backend = _FakeLinker()
+    backend.requires_lookup_confirmation = True
+    backend.restorable = [1]
+    claims = {"held"}
+
+    def discard(rid, transfers, pages):
+        if pages:
+            return False
+        claims.clear()
+        return True
+
+    backend.confirm_lookup = discard
+    if path == "allocation_failure":
+        full_linker_component.build_external_linker_transfer = lambda *args: None
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(
+            _components_tuple=(full_linker_component,),
+            page_size=2,
+            tree_core=SimpleNamespace(
+                enable_external_cache_linker=False, is_eagle=False
+            ),
+        ),
+        backend,
+    )
+    key = RadixKey(array("q", [1, 2]))
+    if path in ("allocation_failure", "device_hit"):
+        wrapper.hit_markers["discard"] = ExternalCacheHitMarker(key, ["page"], 0)
+    req = SimpleNamespace(
+        rid="discard",
+        last_node=0,
+        cache_request_handle=CacheRequestHandle("discard", 0),
+        kv_hints=None,
+    )
+    if path in ("device_hit", "match_rejected"):
+        monkeypatch.setattr(
+            "sglang.srt.mem_cache.utils.get_native_hash", lambda *args: ["page"]
+        )
+        result = MatchResult(
+            device_prefix_len=2 if path == "device_hit" else 0,
+            last_device_node=0,
+            last_host_node=0,
+            best_match_node=0,
+        )
+        assert wrapper.match(key, req, result) == result
+    elif path == "empty_load":
+        wrapper._queue_load(req.rid, req.last_node, [])
+    else:
+        assert wrapper.load_back(req) == (0, 0)
+    assert not claims
+    assert not wrapper.has_hit(req.rid)
 
 
 @pytest.mark.parametrize("success", [False, True])

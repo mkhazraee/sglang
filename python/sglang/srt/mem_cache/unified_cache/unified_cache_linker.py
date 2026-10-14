@@ -20,7 +20,7 @@ The tree only needs a handful of guarded hooks:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
@@ -68,6 +68,7 @@ class UnifiedCacheLinker(ABC):
     loaded_path_is_stored: bool = True
     local_storage_medium: StorageMedium | None = None
     local_storage_ownership: str | None = None
+    requires_lookup_confirmation: bool = False
 
     def set_request_context(
         self, handle: CacheRequestHandle, kv_hints: KvHintsEnvelope | None
@@ -93,7 +94,14 @@ class UnifiedCacheLinker(ABC):
         let the tree pick a length that is invalid on another rank.
 
         Local to this rank; the tree intersects the sets across ranks.
+        Backends requiring confirmation may return optimistic candidates.
         """
+
+    def confirm_lookup(
+        self, rid: str, transfers: list[PoolTransfer], hit_pages: int
+    ) -> bool:
+        """Confirm a shared boundary; zero discards unaccepted lookup claims."""
+        return True
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -210,6 +218,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        previous = self.hit_markers.pop(req.rid, None)
+        if previous is not None and self.cache_linker.requires_lookup_confirmation:
+            self.cache_linker.confirm_lookup(req.rid, [], 0)
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -238,11 +249,15 @@ class UnifiedCacheLinkerWrapper:
         self._request_handles[req.rid] = handle
         self.cache_linker.set_request_context(handle, req.kv_hints)
 
+        def confirm(pages):
+            return self.cache_linker.confirm_lookup(req.rid, lookup_transfers, pages)
+
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
+            confirm=confirm if self.cache_linker.requires_lookup_confirmation else None,
         )
         if hit_pages == 0:
             return result
@@ -272,7 +287,12 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        confirm: Callable[[int], bool] | None = None,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -287,9 +307,15 @@ class UnifiedCacheLinkerWrapper:
                 mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
-        if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+        if confirm is None:
+            return int(common[-1].item()) if common.numel() else 0
+        for pages in reversed(common.flatten().tolist()):
+            accepted = torch.tensor([int(confirm(pages))], dtype=torch.int)
+            self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+            if accepted.item():
+                return pages
+        confirm(0)
+        return 0
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
@@ -337,6 +363,8 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
+                if self.cache_linker.requires_lookup_confirmation:
+                    self.cache_linker.confirm_lookup(req.rid, [], 0)
                 return 0, req.last_node
             component_transfers.append((component, transfer))
 
@@ -424,6 +452,8 @@ class UnifiedCacheLinkerWrapper:
         self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
     ) -> None:
         if not transfers:
+            if self.cache_linker.requires_lookup_confirmation:
+                self.cache_linker.confirm_lookup(rid, [], 0)
             return
         assert rid not in self.pending_loads
         lock_params = self.cache.inc_lock_ref(node_id).to_dec_params()

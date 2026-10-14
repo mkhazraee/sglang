@@ -7,6 +7,12 @@ polls KVCR, including while idle, so peer requests and transfer lifecycle events
 keep progressing. Framework source-pin requests are declined; peers can retrieve
 completed deposits in KVCR-owned DRAM.
 
+For SWA/state layouts, ranks confirm a shared prefix boundary by fetching its
+trailing window into KVCR DRAM with the complete expected layout. Those claims
+remain held through GPU loading. A missing window retries a shorter shared
+boundary; sparse state can require several probes. Full-prefix KV still uses
+direct delivery, and layouts without trailing state skip this confirmation.
+
 ## Setup
 
 Install KVCR with its NIXL/UCX dependencies in the serving environment. Use the
@@ -107,16 +113,16 @@ restarting with cleared storage and matching peers; flush alone is insufficient.
 
 Remote hints use KVCR's versioned `kv.fetch` envelope, with a reachable
 `source_control_endpoint` and uint64 `block_hashes`. Hints are advisory. The
-lookup does not reserve source storage: capacity eviction between lookup and
-delivery is an admitted load failure, including eviction caused by an older
+full-prefix lookup does not reserve source storage: capacity eviction between
+lookup and delivery is an admitted load failure, including eviction caused by an older
 offload. Failed admitted loads follow Linker's error path, without automatic
 recomputation. Unsupported hint actions are ignored with a warning. The
 runtime maps a storage hash's first 16 hexadecimal digits to the router hash.
 With `cache_salt` or `extra_key`, existing KV events use a different hash chain;
 those event hashes do not produce remote hits unless the router supplies the
 corresponding storage hashes. Hints must target the matching source shard. The
-adapter does not rewrite hint endpoints, so remote hints are disabled for layouts
-requiring shard-specific routing. Local reuse remains enabled.
+adapter disables remote hints for layouts requiring shard-specific routing,
+including CP/PP splits. Local reuse remains enabled.
 
 ## Manual checks and profiling
 

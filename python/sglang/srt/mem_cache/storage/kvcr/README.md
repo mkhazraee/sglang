@@ -58,6 +58,7 @@ are strict; unknown names fail startup.
 | `operation_timeout_ms` | `1000` | Positive operation deadline in milliseconds. |
 | `abandon_timeout_ms` | `5000` | Failure-reporting deadline, at least twice the operation timeout. |
 | `enable_telemetry` | `false` | Log aggregate KVCR timings, counters, and state at INFO every five seconds and on close/reset. |
+| `trailing_capacity_divisor` | `1` | Positive integer reducing SWA-derived pools' page capacity in in-process DRAM; each retains at least one page. Guard capacities are configured separately. |
 
 ## Guard memory and fallback
 
@@ -79,8 +80,9 @@ deployment digest on the service and all workers; change it when the model,
 dtype, layout, page size, or parallel topology changes. Storage keys still retain
 their individual shard namespaces.
 
-In fallback mode, each pool receives capacity proportional to its bytes per
-physical page, giving all pools the same page capacity. Set
+In fallback mode, pools receive the same page capacity by default. Increase
+`trailing_capacity_divisor` to give sparsely stored SWA/state pools fewer pages
+and reserve more of the budget for full-prefix pools. Set
 `"kvcr_service_socket_path": null` to select this mode explicitly.
 
 ## Operational constraints

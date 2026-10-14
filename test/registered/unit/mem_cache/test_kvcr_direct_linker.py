@@ -4,7 +4,7 @@ import json
 import threading
 import time
 import unittest
-from collections import deque
+from collections import Counter, deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -601,6 +601,7 @@ class TestKVCRRuntime(CustomTestCase):
             namespace="model-layout-shard",
             pool_layouts=[("small", 8), ("large", 24)],
             pool_counts={"small": 2, "large": 2},
+            trailing_counts=Counter(),
             registrations=[],
             decode_key=lambda key: tuple(key.decode().split(":", 1)),
         )
@@ -656,6 +657,24 @@ class TestKVCRRuntime(CustomTestCase):
                 )
                 self.assertEqual(len(self.attempts), 2 if cause else 1)
                 self.assertIsNone(self.attempts[-1])
+
+    def test_trailing_capacity_preserves_minimum_and_total_budget(self):
+        self.layout.trailing_counts["large"] = 2
+        for divisor, budget, expected in (
+            (1, 128, [32, 96]),
+            (4, 128, [64, 48]),
+            (1024, 64, [16, 48]),
+        ):
+            with self.subTest(divisor=divisor, budget=budget):
+                runtime = self.make_runtime(
+                    kvcr_service_socket_path=None,
+                    dram_size_gb=budget / (1 << 30),
+                    trailing_capacity_divisor=divisor,
+                )
+                sizes = [n for _, _, n in runtime.client.backends.local_dram.pools]
+                self.assertEqual(sizes, expected)
+        with self.assertRaisesRegex(ValueError, "complete page"):
+            self.make_runtime(dram_size_gb=63 / (1 << 30), trailing_capacity_divisor=4)
 
     def test_telemetry_logs_labelled_interval_aggregates_and_flushes_on_close(self):
         module = "sglang.srt.mem_cache.storage.kvcr.runtime"
@@ -805,6 +824,9 @@ class TestKVCRRuntime(CustomTestCase):
             {"guard_index": True},
             {"compatibility_digest": ""},
             {"enable_telemetry": "true"},
+            {"trailing_capacity_divisor": 0},
+            {"trailing_capacity_divisor": True},
+            {"trailing_capacity_divisor": 1.5},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.runtime_type(self.layout, options, rank=2)

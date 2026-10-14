@@ -114,6 +114,14 @@ class TestKVCRLayout(CustomTestCase):
             )
         )
 
+    def test_trailing_capacity_follows_logical_source(self):
+        group = self.group()
+        group.entries[1].indices_from_pool = PoolName.SWA
+        layout = self.layout(group)
+        self.assertEqual(sum(layout.trailing_counts.values()), 1)
+        pool = layout._labels[PoolName.INDEXER][0][0].split(":")[0]
+        self.assertEqual(layout.trailing_counts[pool], layout.pool_counts[pool])
+
     def test_admission_snapshots_translation_and_duplicate_destinations(self):
         group = self.group()
         remap = torch.arange(8)

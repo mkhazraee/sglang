@@ -147,7 +147,8 @@ def _offset_source_ports(hints, offset):
 
 
 class KVCRDirectLinker(UnifiedCacheLinker):
-    loaded_path_is_stored = False
+    # Avoid retaining another local DRAM copy of an externally restored prefix.
+    loaded_path_is_stored = True
     local_storage_medium = StorageMedium.CPU
     local_storage_ownership = "kvcr"
 

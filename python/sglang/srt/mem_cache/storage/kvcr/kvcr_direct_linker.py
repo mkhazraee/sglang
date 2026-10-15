@@ -578,7 +578,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         for handle, result in results:
             operation = self._operations[handle]
             operation.result = result
-            if result.keys() != operation.keys or not all(
+            if set(result) != operation.keys or not all(
                 entry.success for entry in result.values()
             ):
                 if isinstance(operation.owner, _Batch):

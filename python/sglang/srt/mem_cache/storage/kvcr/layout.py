@@ -154,7 +154,7 @@ class KVCRLayout:
         allow_partial: bool = False,
         allow_missing_kv: bool = False,
     ) -> tuple[PreparedTransfer, ...]:
-        """Resolve and snapshot indices once; queries may omit device indices."""
+        """Snapshot KVCR page indices once; queries may omit device indices."""
         resolved = self.group.resolve_transfers(
             transfers,
             allow_partial=allow_partial,
@@ -165,10 +165,10 @@ class KVCRLayout:
             storage_keys = tuple(transfer.keys)
             locations = ()
             if transfer.host_indices is not None:
+                entry = self.group.entry_map[transfer.name]
                 locations = tuple(
-                    self.group.entry_map[transfer.name].prepare_locations(
-                        transfer.host_indices
-                    )
+                    location // entry._row_span
+                    for location in entry.prepare_locations(transfer.host_indices)
                 )
                 if len(storage_keys) != len(locations):
                     raise ValueError(
@@ -220,7 +220,7 @@ class KVCRLayout:
                     MemoryRef(
                         end_point_name=self.endpoint_name,
                         label=label,
-                        element_index=location // entry._row_span,
+                        element_index=location,
                     )
                     for label in labels
                 ]

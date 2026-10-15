@@ -139,7 +139,7 @@ class TestKVCRLayout(CustomTestCase):
         self.assertEqual(len(batches), 2)
         key = layout.encode_key("same", PoolName.KV)
         self.assertEqual([batch[key][0].element_index for batch in batches], [0, 2])
-        self.assertEqual(prepared[0].locations, (0, 4))
+        self.assertEqual(prepared[0].locations, (0, 2))
 
     def test_namespace_tracks_compatibility_and_key_roundtrip(self):
         base = self.layout()

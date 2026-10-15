@@ -127,19 +127,22 @@ class TestKVCRLayout(CustomTestCase):
         remap = torch.arange(8)
         group.entry_map[PoolName.KV]._index_mapper = lambda indices: remap[indices]
         layout = self.layout(group)
-        indices = torch.tensor([0, 1, 4, 5])
+        indices = torch.tensor([0, 1, 2, 3, 4, 5])
         transfer = PoolTransfer(
-            PoolName.KV, keys=["same", "same"], device_indices=indices
+            PoolName.KV, keys=["same", "other", "same"], device_indices=indices
         )
         prepared = layout.prepare([transfer])
         indices.fill_(0)
         remap.fill_(0)
         transfer.keys.clear()
-        batches = layout.mappings(prepared)
-        self.assertEqual(len(batches), 2)
         key = layout.encode_key("same", PoolName.KV)
-        self.assertEqual([batch[key][0].element_index for batch in batches], [0, 2])
-        self.assertEqual(prepared[0].locations, (0, 2))
+        for layer, pool_count in ((None, 2), (0, 1), (2, 2)):
+            batches = layout.mappings(prepared, layer=layer)
+            self.assertEqual(
+                [len(batch) for batch in batches], [2 * pool_count, pool_count]
+            )
+            self.assertEqual([batch[key][0].element_index for batch in batches], [0, 2])
+        self.assertEqual(prepared[0].locations, (0, 1, 2))
 
     def test_namespace_tracks_compatibility_and_key_roundtrip(self):
         base = self.layout()

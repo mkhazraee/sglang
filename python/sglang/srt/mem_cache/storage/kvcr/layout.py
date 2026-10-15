@@ -21,6 +21,7 @@ class PreparedTransfer:
     name: PoolName
     keys: tuple[bytes, ...]
     locations: tuple[int, ...]
+    batch_indices: tuple[int, ...]
 
 
 class KVCRLayout:
@@ -154,7 +155,7 @@ class KVCRLayout:
         allow_partial: bool = False,
         allow_missing_kv: bool = False,
     ) -> tuple[PreparedTransfer, ...]:
-        """Snapshot KVCR page indices once; queries may omit device indices."""
+        """Snapshot page and batch indices; queries may omit device indices."""
         resolved = self.group.resolve_transfers(
             transfers,
             allow_partial=allow_partial,
@@ -175,13 +176,18 @@ class KVCRLayout:
                         f"KVCR pool {transfer.name} has {len(storage_keys)} keys "
                         f"but {len(locations)} pages."
                     )
+            keys = tuple(self.encode_key(key, transfer.name) for key in storage_keys)
+            occurrences: Counter[bytes] = Counter()
+            batch_indices = []
+            for key in keys:
+                batch_indices.append(occurrences[key])
+                occurrences[key] += 1
             prepared.append(
                 PreparedTransfer(
                     name=transfer.name,
-                    keys=tuple(
-                        self.encode_key(key, transfer.name) for key in storage_keys
-                    ),
+                    keys=keys,
                     locations=locations,
+                    batch_indices=tuple(batch_indices),
                 )
             )
         return tuple(prepared)
@@ -193,7 +199,6 @@ class KVCRLayout:
         from kvcr.types import MemoryRef
 
         batches: list[dict[bytes, list[MemoryRef]]] = []
-        occurrences: Counter[bytes] = Counter()
         for transfer in prepared:
             if len(transfer.keys) != len(transfer.locations):
                 raise ValueError(
@@ -211,9 +216,9 @@ class KVCRLayout:
                 labels = [
                     component[index] for component in components for index in indices
                 ]
-            for key, location in zip(transfer.keys, transfer.locations):
-                batch_index = occurrences[key]
-                occurrences[key] += 1
+            for key, location, batch_index in zip(
+                transfer.keys, transfer.locations, transfer.batch_indices
+            ):
                 if batch_index == len(batches):
                     batches.append({})
                 batches[batch_index][key] = [
